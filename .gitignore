@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.ipynb_checkpoints/
+
+# Logs / training outputs
+*.log
+logs/
+runs/
+outputs/
+wandb/
+tensorboard/
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.h5
+
+# Isaac Sim / Isaac Lab caches
+.nv/
+kit/cache/
+*.usd.bak
+*.usda.bak
+
+# Large assets / media (add via Git LFS or share separately)
+*.mp4
+*.avi
+*.mov
+*.gif
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
