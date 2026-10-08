@@ -6,12 +6,9 @@
 - 상태 표현: 천 모서리 4개 keypoint
 - 학습 파이프라인: 스크립트 기반 전문가 시연 생성 → BC 사전학습 → SAC 정책 개선 → 실패 보정(DAgger) → 통합 평가
 
-## 브랜치 규칙
+## 협업 규칙
 
-- `main`: 동작이 확인된 코드만 둔다. 직접 push하지 않는다.
-- 작업은 `feature/<기능명>` 브랜치에서 하고 Pull Request로 머지한다.
-  - 예: `feature/corner-tracker`, `feature/virtual-picker`
-- PR 설명에 실험 결과(실패한 시도 포함)를 함께 적는다.
+브랜치, 커밋, PR, 리뷰 규칙은 [CONTRIBUTING.md](CONTRIBUTING.md), 실험 기록은 [experiments/](experiments/README.md)를 본다.
 
 ## 커밋하지 않는 것
 
