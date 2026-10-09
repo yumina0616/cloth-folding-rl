@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import math
 import sys
+from pathlib import Path
 
 import gymnasium as gym
 import torch
@@ -21,6 +22,7 @@ from isaaclab_tasks.utils import resolve_task_config, setup_preset_cli
 
 import isaaclab_tasks  # noqa: F401
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "corner_tracking"))
 from cloth_corner_tracker import CORNER_LABELS, detect_corner_vertex_indices, get_corner_world_positions
 
 
