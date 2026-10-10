@@ -118,6 +118,10 @@ def main():
         scene = env.unwrapped.scene
         cloth = scene["deformable"]
         ee_frame = scene["ee_frame"]
+        robot = scene["robot"]
+        left_finger_id = robot.find_bodies("panda_leftfinger")[0][0]
+        right_finger_id = robot.find_bodies("panda_rightfinger")[0][0]
+        finger_joint_ids = robot.find_joints("panda_finger_joint.*")[0]
         env_origin = scene.env_origins[0]
 
         action = torch.zeros(env.unwrapped.action_space.shape, device=env.unwrapped.device)
@@ -152,7 +156,8 @@ def main():
             nodes_w = cloth.data.nodal_pos_w.torch[0]
             corner_indices = detect_corner_vertex_indices(nodes_w)
             corners_w = get_corner_world_positions(nodes_w, corner_indices)
-            corner_w = corners_w[nearest_corner_slot(corners_w)].clone()
+            slot = nearest_corner_slot(corners_w)
+            corner_w = corners_w[slot].clone()
 
             center_xy = corners_w[:, :2].mean(dim=0)
             inward = center_xy - corner_w[:2]
@@ -172,12 +177,48 @@ def main():
             move_to(press_w, top_down_quat, 160, 1.0)
             hold(60, 1.0)
 
-            hold(args_cli.close_steps, -1.0)
+            # State right before closing
+            ee_z = float(ee_frame.data.target_pos_w.torch[0, 0, 2].item())
+            node_z = float(cloth.data.nodal_pos_w.torch[0, grasp_node, 2].item())
+            press_gap = ee_z - node_z
+            left_w = robot.data.body_pos_w.torch[0, left_finger_id]
+            right_w = robot.data.body_pos_w.torch[0, right_finger_id]
+            jaw_axis = (right_w - left_w)[:2]
+            jaw_axis = jaw_axis / torch.linalg.vector_norm(jaw_axis)
+            print(f"[press_close] jaw axis (xy)={jaw_axis.cpu().tolist()}, diagonal (xy)={inward.cpu().tolist()}")
 
+            # Close while holding the height and track the ridge between the fingers
+            max_ridge = float("-inf")
+            for _ in range(args_cli.close_steps):
+                hold(1, -1.0)
+                nodes_now = cloth.data.nodal_pos_w.torch[0]
+                near = torch.linalg.vector_norm(nodes_now[:, :2] - grasp_xy, dim=1) <= 0.03
+                ridge = float(nodes_now[near, 2].max().item()) - cloth_z
+                max_ridge = max(max_ridge, ridge)
+            finger_gap = float(robot.data.joint_pos.torch[0, finger_joint_ids].sum().item())
+
+            # Lift and measure how high the grasped point stays
             lift_w = press_w.clone()
             lift_w[2] += args_cli.lift_height
             move_to(lift_w, top_down_quat, 360, -1.0)
-            hold(args_cli.hold_steps, -1.0)
+            min_rise = float("inf")
+            for _ in range(args_cli.hold_steps):
+                hold(1, -1.0)
+                rise = float(cloth.data.nodal_pos_w.torch[0, grasp_node, 2].item()) - cloth_z
+                min_rise = min(min_rise, rise)
+            corner_index = int(corner_indices[slot].item())
+            corner_rise = float(cloth.data.nodal_pos_w.torch[0, corner_index, 2].item() - corner_w[2].item())
+
+            passed = min_rise >= args_cli.lift_success_height
+            print(
+                f"[press_close] SUMMARY | depth={args_cli.press_depth * 1000:.1f} mm"
+                f" | press_gap={press_gap * 1000:.1f} mm"
+                f" | ridge={max_ridge * 1000:.1f} mm"
+                f" | finger_gap={finger_gap * 1000:.1f} mm"
+                f" | hold_min_rise={min_rise * 1000:.1f} mm"
+                f" | corner_rise={corner_rise * 1000:.1f} mm"
+                f" | {'PASS' if passed else 'FAIL'}"
+            )
 
         env.close()
 
