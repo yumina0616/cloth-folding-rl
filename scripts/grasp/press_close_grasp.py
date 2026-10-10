@@ -26,7 +26,7 @@ from cloth_corner_tracker import detect_corner_vertex_indices, get_corner_world_
 TASK = "Isaac-Lift-Cloth-Franka"
 
 parser = argparse.ArgumentParser(description="Press-and-close physical cloth grasp")
-parser.add_argument("--press_depth", type=float, default=0.0, help="Fingertip target below the cloth height [m]")
+parser.add_argument("--press_depth", type=float, default=0.0, help="Fingertip target below the cloth height [m] (negative = above the cloth)")
 parser.add_argument("--inset", type=float, default=0.02, help="Grasp point distance from the corner [m]")
 parser.add_argument("--settle_steps", type=int, default=120)
 parser.add_argument("--close_steps", type=int, default=220)
@@ -95,3 +95,92 @@ def configure_scene():
     env_cfg.sim.default_visualizer_cfg = VisualizerCfg(eye=env_cfg.viewer.eye, lookat=env_cfg.viewer.lookat)
 
     return env_cfg
+
+def smoothstep(value: float) -> float:
+    """Smooth interpolation for robot motion."""
+    value = min(max(value, 0.0), 1.0)
+    return value * value * (3.0 - 2.0 * value)
+
+
+def nearest_corner_slot(corners_w: torch.Tensor) -> int:
+    """Return the corner with minimum x and y coordinates."""
+    target_xy = torch.stack((corners_w[:, 0].min(), corners_w[:, 1].min()))
+    return int(torch.argmin(torch.sum((corners_w[:, :2] - target_xy) ** 2, dim=1)).item())
+
+
+def main():
+    env_cfg = configure_scene()
+    with launch_simulation(env_cfg, args_cli):
+        env = gym.make(TASK, cfg=env_cfg)
+        env.unwrapped.command_manager.get_term("deformable_pose").success_visualizer.set_visibility(False)
+        env.reset()
+
+        scene = env.unwrapped.scene
+        cloth = scene["deformable"]
+        ee_frame = scene["ee_frame"]
+        env_origin = scene.env_origins[0]
+
+        action = torch.zeros(env.unwrapped.action_space.shape, device=env.unwrapped.device)
+        command_pos = ee_frame.data.target_pos_w.torch[0, 0].clone() - env_origin
+        command_quat = ee_frame.data.target_quat_w.torch[0, 0].clone()
+        top_down_quat = action.new_tensor((1.0, 0.0, 0.0, 0.0))
+
+        def hold(steps: int, gripper: float) -> None:
+            action[0, :3] = command_pos
+            action[0, 3:7] = command_quat
+            action[0, 7] = gripper
+            for _ in range(steps):
+                env.step(action)
+
+        def move_to(goal_w: torch.Tensor, quat: torch.Tensor, steps: int, gripper: float) -> None:
+            nonlocal command_pos, command_quat
+            start_pos = command_pos.clone()
+            goal_pos = goal_w - env_origin
+            start_quat = command_quat.clone()
+            for step in range(1, steps + 1):
+                alpha = smoothstep(step / steps)
+                action[0, :3] = torch.lerp(start_pos, goal_pos, alpha)
+                blended_quat = torch.lerp(start_quat, quat, alpha)
+                action[0, 3:7] = blended_quat / torch.linalg.vector_norm(blended_quat)
+                action[0, 7] = gripper
+                env.step(action)
+            command_pos = goal_pos.clone()
+            command_quat = quat.clone()
+
+        with torch.inference_mode():
+            hold(args_cli.settle_steps, 1.0)
+            nodes_w = cloth.data.nodal_pos_w.torch[0]
+            corner_indices = detect_corner_vertex_indices(nodes_w)
+            corners_w = get_corner_world_positions(nodes_w, corner_indices)
+            corner_w = corners_w[nearest_corner_slot(corners_w)].clone()
+
+            center_xy = corners_w[:, :2].mean(dim=0)
+            inward = center_xy - corner_w[:2]
+            inward = inward / torch.linalg.vector_norm(inward)
+            grasp_xy = corner_w[:2] + args_cli.inset * inward
+            grasp_node = int(torch.argmin(torch.linalg.vector_norm(nodes_w[:, :2] - grasp_xy, dim=1)).item())
+            
+            cloth_z = float(nodes_w[grasp_node, 2].item())
+
+
+            above_w = torch.cat((grasp_xy, grasp_xy.new_tensor([cloth_z + 0.055])))
+            move_to(above_w, top_down_quat, 220, 1.0)
+
+            
+            press_w = above_w.clone()
+            press_w[2] = cloth_z - args_cli.press_depth
+            move_to(press_w, top_down_quat, 160, 1.0)
+            hold(60, 1.0)
+
+            hold(args_cli.close_steps, -1.0)
+
+            lift_w = press_w.clone()
+            lift_w[2] += args_cli.lift_height
+            move_to(lift_w, top_down_quat, 360, -1.0)
+            hold(args_cli.hold_steps, -1.0)
+
+        env.close()
+
+
+if __name__ == "__main__":
+    main()
