@@ -7,6 +7,8 @@ so that friction gathers the cloth into a ridge between the fingers.
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import sys
 from pathlib import Path
 import gymnasium as gym
@@ -27,7 +29,15 @@ TASK = "Isaac-Lift-Cloth-Franka"
 
 parser = argparse.ArgumentParser(description="Press-and-close physical cloth grasp")
 parser.add_argument("--press_depth", type=float, default=0.0, help="Fingertip target below the cloth height [m] (negative = above the cloth)")
-parser.add_argument("--inset", type=float, default=0.02, help="Grasp point distance from the corner [m]")
+# [007] Open finger gap. The grasp point inset is computed from it so both fingertips land on the cloth
+parser.add_argument("--open_width", type=float, default=0.08, help="Finger gap when the gripper is open [m] (max 0.08)")
+parser.add_argument("--pad_half", type=float, default=0.01, help="Half width of a finger pad [m] (approximate)")
+parser.add_argument("--edge_margin", type=float, default=0.005, help="Clearance between a finger pad and the cloth edge [m]")
+# [007] Cloth properties
+parser.add_argument("--thickness", type=float, default=0.006, help="Cloth surface thickness [m]")
+parser.add_argument("--bend_scale", type=float, default=1.0, help="Multiplier on the default surface bend stiffness")
+parser.add_argument("--edge_refinement", type=int, default=8, help="Cloth mesh subdivisions per edge (8 -> 9x9 vertices)")
+parser.add_argument("--no_gui", action="store_true", help="Run without the Kit window (faster, for sweeps)")
 parser.add_argument("--settle_steps", type=int, default=120)
 parser.add_argument("--close_steps", type=int, default=220)
 parser.add_argument("--lift_height", type=float, default=0.060)
@@ -35,7 +45,9 @@ parser.add_argument("--lift_success_height", type=float, default=0.020)
 parser.add_argument("--hold_steps", type=int, default=180)
 
 add_launcher_args(parser)
-parser.set_defaults(visualizer=["kit"])
+# Without a visualizer the app runs headless
+if "--no_gui" not in sys.argv:
+    parser.set_defaults(visualizer=["kit"])
 args_cli, hydra_args = setup_preset_cli(parser)
 sys.argv = [sys.argv[0], *hydra_args]
 
@@ -61,12 +73,15 @@ def configure_scene():
     env_cfg.scene.deformable.init_state.pos = (0.5, 0.0, 0.012)
     env_cfg.scene.deformable.init_state.rot = (1.0, 0.0, 0.0, 0.0)
     cloth_material = env_cfg.scene.deformable.spawn.physics_material
-    cloth_material.surface_thickness = 0.006
+    cloth_material.surface_thickness = args_cli.thickness
     cloth_material.density = 150.0
     cloth_material.static_friction = 2.0
     cloth_material.elasticity_damping = 0.25
     cloth_material.dynamic_friction = 1.5
     cloth_material.bend_damping = 0.25
+    # [007] Scale the task default; fails loudly if a non-PhysX cloth config is selected
+    cloth_material.surface_bend_stiffness *= args_cli.bend_scale
+    env_cfg.scene.deformable.spawn.edge_refinement = args_cli.edge_refinement
 
     env_cfg.scene.robot.spawn.make_uninstanceable = True
     env_cfg.scene.robot.spawn.physics_material = sim_utils.RigidBodyMaterialCfg(
@@ -85,6 +100,8 @@ def configure_scene():
     env_cfg.curriculum.gravity = None
     env_cfg.curriculum.action_rate = None
     env_cfg.actions = type(env_cfg)().actions.ik
+    # [007] Open finger joint target. One joint moves one finger, so half of the gap
+    env_cfg.actions.gripper_action.open_command_expr = {"panda_finger_joint1": args_cli.open_width / 2}
 
     for term_name in vars(env_cfg.terminations):
         if term_name != "time_out":
@@ -162,7 +179,11 @@ def main():
             center_xy = corners_w[:, :2].mean(dim=0)
             inward = center_xy - corner_w[:2]
             inward = inward / torch.linalg.vector_norm(inward)
-            grasp_xy = corner_w[:2] + args_cli.inset * inward
+            # [007] Both fingertips must land on the cloth. The jaw closes along y and the
+            # corner diagonal is at 45 deg, so the grasp point must be this far from each edge
+            edge_dist = args_cli.open_width / 2 + args_cli.pad_half + args_cli.edge_margin
+            inset = math.sqrt(2.0) * edge_dist
+            grasp_xy = corner_w[:2] + inset * inward
             grasp_node = int(torch.argmin(torch.linalg.vector_norm(nodes_w[:, :2] - grasp_xy, dim=1)).item())
             
             cloth_z = float(nodes_w[grasp_node, 2].item())
@@ -186,6 +207,27 @@ def main():
             jaw_axis = (right_w - left_w)[:2]
             jaw_axis = jaw_axis / torch.linalg.vector_norm(jaw_axis)
             print(f"[press_close] jaw axis (xy)={jaw_axis.cpu().tolist()}, diagonal (xy)={inward.cpu().tolist()}")
+
+            # [007] Check where the open fingers are. Finger body origins, not the exact pad tips
+            open_gap = float(robot.data.joint_pos.torch[0, finger_joint_ids].sum().item())
+            cloth_min = corners_w[:, :2].min(dim=0).values
+            cloth_max = corners_w[:, :2].max(dim=0).values
+
+            def inside_dist(point_w: torch.Tensor) -> float:
+                """Distance from a point to the nearest cloth edge in xy (negative = outside)."""
+                gaps = torch.cat((point_w[:2] - cloth_min, cloth_max - point_w[:2]))
+                return float(gaps.min().item())
+
+            left_in = inside_dist(left_w)
+            right_in = inside_dist(right_w)
+            left_z = float(left_w[2].item()) - node_z
+            right_z = float(right_w[2].item()) - node_z
+            print(
+                f"[press_close] open_gap={open_gap * 1000:.1f} mm (requested {args_cli.open_width * 1000:.1f})"
+                f" | inset={inset * 1000:.1f} mm"
+                f" | finger inside cloth: left={left_in * 1000:.1f} mm, right={right_in * 1000:.1f} mm"
+                f" | finger origin above cloth: left={left_z * 1000:.1f} mm, right={right_z * 1000:.1f} mm"
+            )
 
             # Close while holding the height and track the ridge between the fingers
             max_ridge = float("-inf")
@@ -219,6 +261,29 @@ def main():
                 f" | corner_rise={corner_rise * 1000:.1f} mm"
                 f" | {'PASS' if passed else 'FAIL'}"
             )
+
+            # [007] One machine-readable line for the sweep runner (lengths in mm)
+            result = {
+                "press_depth": args_cli.press_depth * 1000,
+                "open_width": args_cli.open_width * 1000,
+                "thickness": args_cli.thickness * 1000,
+                "bend_scale": args_cli.bend_scale,
+                "edge_refinement": args_cli.edge_refinement,
+                "num_nodes": int(nodes_w.shape[0]),
+                "inset": inset * 1000,
+                "open_gap": open_gap * 1000,
+                "left_in": left_in * 1000,
+                "right_in": right_in * 1000,
+                "left_z": left_z * 1000,
+                "right_z": right_z * 1000,
+                "press_gap": press_gap * 1000,
+                "ridge": max_ridge * 1000,
+                "finger_gap": finger_gap * 1000,
+                "hold_min_rise": min_rise * 1000,
+                "corner_rise": corner_rise * 1000,
+                "passed": bool(passed),
+            }
+            print("[press_close] RESULT " + json.dumps(result))
 
         env.close()
 
