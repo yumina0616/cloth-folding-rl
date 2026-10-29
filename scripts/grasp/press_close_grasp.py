@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 import sys
 from pathlib import Path
 import gymnasium as gym
@@ -38,6 +39,13 @@ parser.add_argument("--thickness", type=float, default=0.006, help="Cloth surfac
 parser.add_argument("--bend_scale", type=float, default=1.0, help="Multiplier on the default surface bend stiffness")
 parser.add_argument("--edge_refinement", type=int, default=8, help="Cloth mesh subdivisions per edge (8 -> 9x9 vertices)")
 parser.add_argument("--no_gui", action="store_true", help="Run without the Kit window (faster, for sweeps)")
+# [008] Table friction and repeated trials
+parser.add_argument("--table_friction", type=float, default=0.03, help="Table dynamic friction (static = dynamic + 0.01)")
+parser.add_argument("--seed", type=int, default=0, help="Seed for the cloth position jitter")
+parser.add_argument("--pos_jitter", type=float, default=0.0, help="Max random shift of the cloth start position in x and y [m]")
+# [008] Where to put the grasp point: "axis" moves it closer to the corner, "diagonal" is the 007 layout
+parser.add_argument("--grasp_layout", choices=("axis", "diagonal"), default="axis")
+parser.add_argument("--quality_max", type=float, default=0.03, help="Grasp quality: max corner-to-gripper distance while held [m] (#14)")
 parser.add_argument("--settle_steps", type=int, default=120)
 parser.add_argument("--close_steps", type=int, default=220)
 parser.add_argument("--lift_height", type=float, default=0.060)
@@ -51,6 +59,12 @@ if "--no_gui" not in sys.argv:
 args_cli, hydra_args = setup_preset_cli(parser)
 sys.argv = [sys.argv[0], *hydra_args]
 
+# [008] Same seed -> same cloth shift, so a run can be reproduced
+TABLE_TOP_Z = 0.0
+_rng = random.Random(args_cli.seed)
+cloth_offset = (_rng.uniform(-args_cli.pos_jitter, args_cli.pos_jitter),
+                _rng.uniform(-args_cli.pos_jitter, args_cli.pos_jitter))
+
 def configure_scene():
     env_cfg, _ = resolve_task_config(TASK, "")
     env_cfg.sim.device = args_cli.device
@@ -62,15 +76,18 @@ def configure_scene():
     # Same physics as physical_grasp_cloth_corner.py (baseline)
     env_cfg.scene.table.spawn.size = (1.3, 0.5, 1.05)
     env_cfg.scene.table.spawn.visible = True
+    # [008] Table top height, to see how far above it the cloth comes to rest (assumes a centered cuboid)
+    global TABLE_TOP_Z
+    TABLE_TOP_Z = float(env_cfg.scene.table.init_state.pos[2]) + env_cfg.scene.table.spawn.size[2] / 2
     env_cfg.scene.table.spawn.physics_material = sim_utils.RigidBodyMaterialCfg(
-        static_friction=0.04,
-        dynamic_friction=0.03,
+        static_friction=args_cli.table_friction + 0.01,
+        dynamic_friction=args_cli.table_friction,
         restitution=0.0,
         friction_combine_mode="min",
     )
 
     # [006] Place the cloth at the table center (no table edge needed)
-    env_cfg.scene.deformable.init_state.pos = (0.5, 0.0, 0.012)
+    env_cfg.scene.deformable.init_state.pos = (0.5 + cloth_offset[0], 0.0 + cloth_offset[1], 0.012)
     env_cfg.scene.deformable.init_state.rot = (1.0, 0.0, 0.0, 0.0)
     cloth_material = env_cfg.scene.deformable.spawn.physics_material
     cloth_material.surface_thickness = args_cli.thickness
@@ -175,15 +192,25 @@ def main():
             corners_w = get_corner_world_positions(nodes_w, corner_indices)
             slot = nearest_corner_slot(corners_w)
             corner_w = corners_w[slot].clone()
+            corner_index = int(corner_indices[slot].item())
+            # [008] Resting height of the cloth above the table top (collision thickness check)
+            settle_gap = float(nodes_w[:, 2].median().item()) - TABLE_TOP_Z
 
             center_xy = corners_w[:, :2].mean(dim=0)
             inward = center_xy - corner_w[:2]
             inward = inward / torch.linalg.vector_norm(inward)
-            # [007] Both fingertips must land on the cloth. The jaw closes along y and the
-            # corner diagonal is at 45 deg, so the grasp point must be this far from each edge
-            edge_dist = args_cli.open_width / 2 + args_cli.pad_half + args_cli.edge_margin
-            inset = math.sqrt(2.0) * edge_dist
-            grasp_xy = corner_w[:2] + inset * inward
+            # Both fingertips must land on the cloth. The jaw closes along y, so the fingers
+            # spread only in y: y needs room for half the gap, x only for the pad itself
+            pad_room = args_cli.pad_half + args_cli.edge_margin
+            jaw_room = args_cli.open_width / 2 + pad_room
+            if args_cli.grasp_layout == "axis":
+                # [008] x: pad only, y: half gap + pad -> closer to the corner
+                toward_center = torch.sign(center_xy - corner_w[:2])
+                grasp_xy = corner_w[:2] + toward_center * corner_w.new_tensor((pad_room, jaw_room))
+            else:
+                # [007] Same distance from both edges, on the 45 deg diagonal
+                grasp_xy = corner_w[:2] + math.sqrt(2.0) * jaw_room * inward
+            inset = float(torch.linalg.vector_norm(grasp_xy - corner_w[:2]).item())
             grasp_node = int(torch.argmin(torch.linalg.vector_norm(nodes_w[:, :2] - grasp_xy, dim=1)).item())
             
             cloth_z = float(nodes_w[grasp_node, 2].item())
@@ -244,11 +271,18 @@ def main():
             lift_w[2] += args_cli.lift_height
             move_to(lift_w, top_down_quat, 360, -1.0)
             min_rise = float("inf")
+            corner_tcp_max = 0.0
             for _ in range(args_cli.hold_steps):
                 hold(1, -1.0)
                 rise = float(cloth.data.nodal_pos_w.torch[0, grasp_node, 2].item()) - cloth_z
                 min_rise = min(min_rise, rise)
-            corner_index = int(corner_indices[slot].item())
+                # [008] How far the corner hangs from the gripper center (TCP)
+                tcp_w = ee_frame.data.target_pos_w.torch[0, 0]
+                corner_now = cloth.data.nodal_pos_w.torch[0, corner_index]
+                corner_tcp = float(torch.linalg.vector_norm(corner_now - tcp_w).item())
+                corner_tcp_max = max(corner_tcp_max, corner_tcp)
+            gathered = open_gap - finger_gap  # [008] cloth width pulled in between the fingers
+            quality_ok = corner_tcp <= args_cli.quality_max
             corner_rise = float(cloth.data.nodal_pos_w.torch[0, corner_index, 2].item() - corner_w[2].item())
 
             passed = min_rise >= args_cli.lift_success_height
@@ -259,12 +293,21 @@ def main():
                 f" | finger_gap={finger_gap * 1000:.1f} mm"
                 f" | hold_min_rise={min_rise * 1000:.1f} mm"
                 f" | corner_rise={corner_rise * 1000:.1f} mm"
+                f" | corner_to_gripper={corner_tcp * 1000:.1f} mm"
+                f" | gathered={gathered * 1000:.1f} mm"
                 f" | {'PASS' if passed else 'FAIL'}"
+                f" | quality {'OK' if quality_ok else 'NG'}"
             )
 
             # [007] One machine-readable line for the sweep runner (lengths in mm)
             result = {
                 "press_depth": args_cli.press_depth * 1000,
+                "table_friction": args_cli.table_friction,
+                "grasp_layout": args_cli.grasp_layout,
+                "seed": args_cli.seed,
+                "cloth_dx": cloth_offset[0] * 1000,
+                "cloth_dy": cloth_offset[1] * 1000,
+                "settle_gap": settle_gap * 1000,
                 "open_width": args_cli.open_width * 1000,
                 "thickness": args_cli.thickness * 1000,
                 "bend_scale": args_cli.bend_scale,
@@ -281,6 +324,10 @@ def main():
                 "finger_gap": finger_gap * 1000,
                 "hold_min_rise": min_rise * 1000,
                 "corner_rise": corner_rise * 1000,
+                "corner_tcp": corner_tcp * 1000,
+                "corner_tcp_max": corner_tcp_max * 1000,
+                "gathered": gathered * 1000,
+                "quality_ok": bool(quality_ok),
                 "passed": bool(passed),
             }
             print("[press_close] RESULT " + json.dumps(result))
