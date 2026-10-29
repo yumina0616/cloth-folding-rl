@@ -1,7 +1,9 @@
 """
-Run press_close_grasp.py over a grid of settings (experiment 007).
-Each combination runs in its own process. Results are appended to a CSV
-right after each run, so the sweep can be stopped and resumed.
+Run press_close_grasp.py over a grid of settings (experiment 008).
+Stage 1 runs every combination once. Stage 2 then picks the best combinations
+automatically and repeats each one with the cloth shifted slightly (#14: 4 of 5).
+Each run is its own process. Results are appended to a CSV right after each run,
+so the sweep can be stopped and resumed.
 
 Run from the Isaac Lab folder:
     .\\isaaclab.bat -p C:\\cloth-folding-rl\\scripts\\grasp\\sweep_press_close.py
@@ -24,35 +26,50 @@ sys.stdout.reconfigure(errors="replace")
 REPO = Path(__file__).resolve().parents[2]
 GRASP_SCRIPT = Path(__file__).resolve().parent / "press_close_grasp.py"
 
-# Grid (lengths in m). Edit here to change the sweep.
-OPEN_WIDTHS = [0.03, 0.05, 0.08]
-PRESS_DEPTHS = [0.0, 0.003, 0.006]
-THICKNESSES = [0.003, 0.006]
-BEND_SCALES = [1.0, 0.1, 0.01]
-EDGE_REFINEMENTS = [16, 32]
+# Grid (lengths in m). Every combination of these values is run. Edit here to change the sweep.
+GRID = {
+    "open_width": [0.03, 0.04],
+    "edge_refinement": [32, 48, 64],
+    "table_friction": [0.03, 0.3],
+}
+# Same for every run. Finger-cloth friction (1.5) is fixed inside press_close_grasp.py
+FIXED = {
+    "press_depth": 0.0,
+    "thickness": 0.003,
+    "bend_scale": 1.0,
+    "grasp_layout": "axis",
+    "seed": 0,
+    "pos_jitter": 0.0,
+}
 
-# The first run checks that the gripper opening and mesh settings are applied
-PREFLIGHT = {"open_width": 0.03, "press_depth": 0.0, "thickness": 0.006, "bend_scale": 1.0, "edge_refinement": 32}
+# The first run checks that the gripper opening and mesh settings are applied.
+# It uses the finest mesh, so its duration is a safe upper bound for the time estimate
+PREFLIGHT = {**FIXED, "open_width": 0.03, "edge_refinement": 64, "table_friction": 0.03}
 
-PARAM_KEYS = ["open_width", "press_depth", "thickness", "bend_scale", "edge_refinement"]
+PARAM_KEYS = [*GRID, *FIXED]
 RESULT_KEYS = [
-    "num_nodes", "inset", "open_gap", "left_in", "right_in", "left_z", "right_z",
-    "press_gap", "ridge", "finger_gap", "hold_min_rise", "corner_rise", "passed",
+    "num_nodes", "settle_gap", "cloth_dx", "cloth_dy", "inset", "open_gap", "left_in", "right_in",
+    "press_gap", "ridge", "finger_gap", "gathered", "hold_min_rise", "corner_rise",
+    "corner_tcp", "corner_tcp_max", "passed", "quality_ok",
 ]
 CSV_FIELDS = ["run_id", "status", "duration_s", *PARAM_KEYS, *RESULT_KEYS]
 
 parser = argparse.ArgumentParser(description="Grid sweep for the press-and-close grasp")
-parser.add_argument("--out", type=Path, default=REPO / "logs" / "sweep_007", help="Folder for results.csv and run logs")
+parser.add_argument("--out", type=Path, default=REPO / "logs" / "sweep_008", help="Folder for results.csv and run logs")
 parser.add_argument("--timeout", type=float, default=900.0, help="Seconds before a stuck run is killed")
 parser.add_argument("--retry_failed", action="store_true", help="Run ERROR/TIMEOUT combinations again")
 parser.add_argument("--skip_preflight", action="store_true")
+parser.add_argument("--top", type=int, default=3, help="Stage 2: how many stage-1 combinations to repeat")
+parser.add_argument("--repeats", type=int, default=5, help="Stage 2: runs per combination (seeds 1..N)")
+parser.add_argument("--jitter", type=float, default=0.01, help="Stage 2: max cloth start shift in x and y [m]")
+parser.add_argument("--need", type=int, default=4, help="Stage 2: successes needed out of --repeats (#14)")
 args = parser.parse_args()
 
 
 def run_id_of(params: dict) -> str:
     return (
-        f"w{params['open_width'] * 1000:.0f}_d{params['press_depth'] * 1000:.0f}"
-        f"_t{params['thickness'] * 1000:.0f}_b{params['bend_scale']:g}_r{params['edge_refinement']}"
+        f"w{params['open_width'] * 1000:.0f}_r{params['edge_refinement']}"
+        f"_tf{params['table_friction']:g}_s{params['seed']}"
     )
 
 
@@ -67,16 +84,10 @@ def load_done(csv_path: Path) -> dict[str, dict]:
 def run_one(params: dict, log_dir: Path) -> dict:
     """Run one combination in a new process and return a CSV row."""
     run_id = run_id_of(params)
-    cmd = [
-        sys.executable, str(GRASP_SCRIPT),
-        "--open_width", str(params["open_width"]),
-        "--press_depth", str(params["press_depth"]),
-        "--thickness", str(params["thickness"]),
-        "--bend_scale", str(params["bend_scale"]),
-        "--edge_refinement", str(params["edge_refinement"]),
-        "--no_gui",
-        "physics=physx",
-    ]
+    cmd = [sys.executable, str(GRASP_SCRIPT)]
+    for key in PARAM_KEYS:
+        cmd += [f"--{key}", str(params[key])]
+    cmd += ["--no_gui", "physics=physx"]
     log_path = log_dir / f"{run_id}.log"
     start = time.time()
     status = "ERROR"
@@ -124,20 +135,55 @@ def check_preflight(row: dict) -> list[str]:
     return problems
 
 
+def combo_id(run_id: str) -> str:
+    """Run id without the seed, e.g. w30_r64_tf0.3"""
+    return run_id.rsplit("_s", 1)[0]
+
+
+def pick_repeats(stage1_rows: list[dict]) -> list[dict]:
+    """Stage-1 combinations worth repeating: lifted, fingers on the cloth, best quality first."""
+    candidates = [
+        r for r in stage1_rows
+        if r["status"] == "OK" and r["passed"] == "True"
+        and float(r["left_in"]) > 0 and float(r["right_in"]) > 0
+    ]
+    candidates.sort(key=lambda r: (r["quality_ok"] != "True", float(r["corner_tcp"])))
+    repeats = []
+    for r in candidates[: args.top]:
+        base = {**FIXED, "open_width": float(r["open_width"]), "edge_refinement": int(r["edge_refinement"]),
+                "table_friction": float(r["table_friction"]), "pos_jitter": args.jitter}
+        repeats += [{**base, "seed": seed} for seed in range(1, args.repeats + 1)]
+    return repeats
+
+
+def print_repeat_summary(csv_path: Path) -> None:
+    rows = [r for r in load_done(csv_path).values() if r["seed"] != "0"]
+    if not rows:
+        return
+    print(f"\n[sweep] 2차 반복 결과 ({args.repeats}번 중 {args.need}번 이상이면 #14 통과)")
+    for combo in sorted({combo_id(r["run_id"]) for r in rows}):
+        runs = [r for r in rows if combo_id(r["run_id"]) == combo and r["status"] == "OK"]
+        lifted = sum(r["passed"] == "True" for r in runs)
+        both = sum(r["passed"] == "True" and r["quality_ok"] == "True" for r in runs)
+        verdict = "통과" if both >= args.need else "불통과"
+        print(f"  {combo:<16} 들림 {lifted}/{len(runs)} | 들림+품질 {both}/{len(runs)} | {verdict}")
+
+
 def print_summary(csv_path: Path) -> None:
-    rows = list(load_done(csv_path).values())
+    rows = [r for r in load_done(csv_path).values() if r["seed"] == "0"]
     ok = [r for r in rows if r["status"] == "OK"]
-    print(f"\n[sweep] 완료: 총 {len(rows)}회, 정상 {len(ok)}회, 오류·시간초과 {len(rows) - len(ok)}회")
-    # Rank: PASS first, then how high the cloth stayed, then the ridge height
-    ok.sort(key=lambda r: (r["passed"] == "True", float(r["hold_min_rise"]), float(r["ridge"])), reverse=True)
-    print("[sweep] 상위 10개 조합 (단위 mm, 손가락_천위=아니오면 손가락이 천 밖에 있었으므로 결과를 믿으면 안 됨)")
-    for r in ok[:10]:
+    print(f"\n[sweep] 1차 완료: 총 {len(rows)}회, 정상 {len(ok)}회, 오류·시간초과 {len(rows) - len(ok)}회")
+    # Rank: lifted first, then good quality, then the corner closest to the gripper
+    ok.sort(key=lambda r: (r["passed"] != "True", r["quality_ok"] != "True", float(r["corner_tcp"])))
+    print("[sweep] 상위 조합 (단위 mm. 들림=20 mm 이상 유지, 품질=모서리가 그리퍼에서 3 cm 이내)")
+    for r in ok[:12]:
         on_cloth = float(r["left_in"]) > 0 and float(r["right_in"]) > 0
         print(
-            f"  {r['run_id']:<28} {'성공' if r['passed'] == 'True' else '실패'}"
+            f"  {r['run_id']:<22} 들림 {'O' if r['passed'] == 'True' else 'X'}"
+            f" | 품질 {'O' if r['quality_ok'] == 'True' else 'X'}"
+            f" | 모서리거리={float(r['corner_tcp']):.1f} | 빨려든폭={float(r['gathered']):.1f}"
             f" | 유지높이={float(r['hold_min_rise']):.1f} | 봉우리={float(r['ridge']):.1f}"
-            f" | 손가락간격={float(r['finger_gap']):.1f} | 누름간격={float(r['press_gap']):.1f}"
-            f" | 손가락_천위={'예' if on_cloth else '아니오'}"
+            f" | 천높이={float(r['settle_gap']):.1f} | 손가락_천위={'예' if on_cloth else '아니오'}"
         )
     print(f"[sweep] 전체 결과 표: {csv_path}")
 
@@ -147,14 +193,12 @@ def main() -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
     csv_path = args.out / "results.csv"
 
-    grid = [dict(zip(PARAM_KEYS, values)) for values in itertools.product(
-        OPEN_WIDTHS, PRESS_DEPTHS, THICKNESSES, BEND_SCALES, EDGE_REFINEMENTS
-    )]
+    grid = [{**FIXED, **dict(zip(GRID, values))} for values in itertools.product(*GRID.values())]
     skip_status = {"OK", "NO_RESULT"} if args.retry_failed else {"OK", "NO_RESULT", "ERROR", "TIMEOUT"}
 
-    def pending() -> list[dict]:
+    def pending(runs: list[dict]) -> list[dict]:
         done = load_done(csv_path)
-        return [p for p in grid if done.get(run_id_of(p), {}).get("status") not in skip_status]
+        return [p for p in runs if done.get(run_id_of(p), {}).get("status") not in skip_status]
 
     if not args.skip_preflight and run_id_of(PREFLIGHT) not in load_done(csv_path):
         print(f"[sweep] 점검 실행 중: {run_id_of(PREFLIGHT)} ... (통과 메시지가 나올 때까지 지켜봐 주세요)")
@@ -168,19 +212,32 @@ def main() -> None:
             print(f"[sweep] 로그 파일: {log_dir / (row['run_id'] + '.log')}")
             sys.exit(1)
         append_row(csv_path, row)
-        remaining = len(pending())
+        remaining = len(pending(grid)) + args.top * args.repeats
         hours = remaining * float(row["duration_s"]) / 3600
-        print(f"[sweep] 점검 통과 (1회 {row['duration_s']}초).")
-        print(f"[sweep] 이제 자리를 비워도 됩니다. 남은 실행 {remaining}회, 약 {hours:.1f}시간 예상.")
+        print(f"[sweep] 점검 통과 (1회 {row['duration_s']}초, 가장 촘촘한 메시 기준).")
+        print(f"[sweep] 이제 자리를 비워도 됩니다. 남은 실행 최대 {remaining}회 (1차 + 2차 반복), 최대 약 {hours:.1f}시간 예상.")
 
-    todo = pending()
-    for i, params in enumerate(todo, start=1):
-        print(f"[sweep] {i}/{len(todo)} {run_id_of(params)}", flush=True)
-        row = run_one(params, log_dir)
-        append_row(csv_path, row)
-        print(f"[sweep]   -> {row['status']} ({row['duration_s']}초)", flush=True)
+    def run_all(runs: list[dict], stage: str) -> None:
+        todo = pending(runs)
+        for i, params in enumerate(todo, start=1):
+            print(f"[sweep] {stage} {i}/{len(todo)} {run_id_of(params)}", flush=True)
+            row = run_one(params, log_dir)
+            append_row(csv_path, row)
+            print(f"[sweep]   -> {row['status']} ({row['duration_s']}초)", flush=True)
 
+    run_all(grid, "1차")
     print_summary(csv_path)
+
+    # Stage 2: repeat the best stage-1 combinations with the cloth shifted slightly
+    stage1 = [r for r in load_done(csv_path).values() if r["seed"] == "0"]
+    repeats = pick_repeats(stage1)
+    if not repeats:
+        print("\n[sweep] 1차에서 들어 올린 조합이 없어 2차 반복은 건너뜁니다.")
+        return
+    picked = sorted({combo_id(run_id_of(p)) for p in repeats})
+    print(f"\n[sweep] 2차 반복 시작: {', '.join(picked)} 각 {args.repeats}번 (천 위치 ±{args.jitter * 1000:.0f} mm)")
+    run_all(repeats, "2차")
+    print_repeat_summary(csv_path)
 
 
 if __name__ == "__main__":
