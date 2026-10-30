@@ -45,6 +45,7 @@ parser.add_argument("--seed", type=int, default=0, help="Seed for the cloth posi
 parser.add_argument("--pos_jitter", type=float, default=0.0, help="Max random shift of the cloth start position in x and y [m]")
 # [008] Where to put the grasp point: "axis" moves it closer to the corner, "diagonal" is the 007 layout
 parser.add_argument("--grasp_layout", choices=("axis", "diagonal"), default="axis")
+parser.add_argument("--linger", type=float, default=0.0, help="Keep simulating (holding the cloth) this many seconds after the result, so the window stays open for recording")
 parser.add_argument("--quality_max", type=float, default=0.03, help="Grasp quality: max corner-to-gripper distance while held [m] (#14)")
 parser.add_argument("--settle_steps", type=int, default=120)
 parser.add_argument("--close_steps", type=int, default=220)
@@ -331,6 +332,11 @@ def main():
                 "passed": bool(passed),
             }
             print("[press_close] RESULT " + json.dumps(result))
+
+            # Keep the window alive for screen recording (env step = 1/30 s)
+            if args_cli.linger > 0:
+                print(f"[press_close] keeping the window open for {args_cli.linger:.0f} s")
+                hold(int(args_cli.linger * 30), -1.0)
 
         env.close()
 
