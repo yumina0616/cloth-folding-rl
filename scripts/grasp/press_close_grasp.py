@@ -17,6 +17,7 @@ import torch
 
 import isaaclab.sim as sim_utils
 from isaaclab.app import add_launcher_args, launch_simulation
+from isaaclab.envs.utils.video_recorder_cfg import VideoRecorderCfg
 from isaaclab.visualizers import VisualizerCfg
 
 from isaaclab_tasks.utils import resolve_task_config, setup_preset_cli
@@ -45,6 +46,8 @@ parser.add_argument("--seed", type=int, default=0, help="Seed for the cloth posi
 parser.add_argument("--pos_jitter", type=float, default=0.0, help="Max random shift of the cloth start position in x and y [m]")
 # [008] Where to put the grasp point: "axis" moves it closer to the corner, "diagonal" is the 007 layout
 parser.add_argument("--grasp_layout", choices=("axis", "diagonal"), default="axis")
+parser.add_argument("--video", action="store_true", help="Save an mp4 of the whole run (Isaac Lab video recorder)")
+parser.add_argument("--video_dir", default=str(Path(__file__).resolve().parents[2] / "logs" / "videos"), help="Folder for --video clips")
 parser.add_argument("--linger", type=float, default=0.0, help="Keep simulating (holding the cloth) this many seconds after the result, so the window stays open for recording")
 parser.add_argument("--quality_max", type=float, default=0.03, help="Grasp quality: max corner-to-gripper distance while held [m] (#14)")
 parser.add_argument("--settle_steps", type=int, default=120)
@@ -128,6 +131,16 @@ def configure_scene():
     env_cfg.viewer.eye = (1.05, 0.45, 0.40)
     env_cfg.viewer.lookat =  (0.45, -0.05, 0.02)
     env_cfg.sim.default_visualizer_cfg = VisualizerCfg(eye=env_cfg.viewer.eye, lookat=env_cfg.viewer.lookat)
+
+    # [008] Record the whole run to an mp4 (works with or without the window)
+    if args_cli.video:
+        total_steps = 1320 + int(args_cli.linger * 30)  # settle..hold steps of main() + linger
+        name = (f"w{args_cli.open_width * 1000:.0f}_r{args_cli.edge_refinement}"
+                f"_tf{args_cli.table_friction:g}_s{args_cli.seed}")
+        env_cfg.video_recorders = [VideoRecorderCfg(
+            source="viz:kit", output_dir=args_cli.video_dir,
+            video_length=total_steps, output_filename_prefix=name,
+        )]
 
     return env_cfg
 
