@@ -37,3 +37,7 @@ kit/cache/
 .idea/
 .DS_Store
 Thumbs.db
+
+videos/
+
+scripts/grasp/video_dependencies/
