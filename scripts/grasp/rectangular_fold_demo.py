@@ -1,3 +1,4 @@
+
 """Sequential rectangular cloth fold with one virtual gripper.
 
 Run with the Isaac Lab launcher; see README_rectangular_fold.md.
@@ -29,6 +30,14 @@ from isaaclab.managers import EventTermCfg
 from isaaclab.utils.math import subtract_frame_transforms
 from isaaclab_tasks.utils import resolve_task_config, setup_preset_cli
 import isaaclab_tasks  # noqa: F401
+
+# 프로젝트 루트 경로 추가
+project_root = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(project_root))
+
+# 보상 함수와 데이터 저장 기능 불러오기
+from scripts.learning.reward import compute_reward, check_fold_success
+from scripts.learning.trajectory_logger import TrajectoryLogger
 
 from a_single_point_picker import as_tensor
 from virtual_attachment_picker import create_picker, filter_gripper_contacts
@@ -121,6 +130,9 @@ def main():
 
     run_dir = args.video_dir.resolve() / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     run_dir.mkdir(parents=True, exist_ok=False)
+    logger = TrajectoryLogger(
+        project_root / "data" / "demonstrations" / f"{run_dir.name}.jsonl"
+    )
     (run_dir / "config.json").write_text(json.dumps(vars(args), default=str, indent=2), encoding="utf-8")
     result = {"success": False, "status": "running", "threshold_m": args.success_distance}
     rows = []
@@ -311,7 +323,6 @@ def main():
                 hold(math.ceil(args.settle_seconds / base.physics_dt))
                 print(f"[fold] after placement {number}: distances={pair_distances(corners(), pairs)}", flush=True)
 
-
             with torch.inference_mode():
                 hold(120)
                 corner_indices = detect_corner_vertex_indices(as_tensor(cloth.data.nodal_pos_w)[0])
@@ -320,8 +331,31 @@ def main():
                 result["pairs"] = pairs
                 result["initial_distances_m"] = pair_distances(corners(), pairs)
                 print(f"[fold] tracked vertices={corner_indices.tolist()}, pairs={pairs}", flush=True)
+
+                # Record each high-level Pick & Place without changing the fold controller.
                 for number, (source, destination) in enumerate(pairs, 1):
+                    before_corners = corners().clone()
+                    pick_xy = before_corners[source, :2].cpu().tolist()
+                    place_xy = before_corners[destination, :2].cpu().tolist()
+
                     place_corner(source, destination, number)
+
+                    after_corners = corners().clone()
+                    success = check_fold_success(
+                        after_corners, pairs, threshold=args.success_distance
+                    )
+                    reward = compute_reward(
+                        before_corners, after_corners, pairs, success=success
+                    )
+                    logger.add_step(
+                        observation={"corners": before_corners.cpu().tolist()},
+                        action={"pick": pick_xy, "place": place_xy},
+                        next_observation={"corners": after_corners.cpu().tolist()},
+                        reward=reward,
+                        success=success,
+                        done=False,
+                    )
+
                 result["correction_count"] = 0
                 # Re-read the released cloth and correct only the worst pair.
                 # Tiny corrections use a low arc rather than lifting 12cm again.
@@ -331,18 +365,65 @@ def main():
                     distances = pair_distances(corners(), pairs)
                     if all(d <= args.success_distance for d in distances):
                         break
+
                     worst = max(range(len(pairs)), key=distances.__getitem__)
                     print(f"[fold] correction {correction + 1}: pair={worst}, error={distances[worst]:.4f} m", flush=True)
-                    place_corner(*pairs[worst], number=f"correction_{correction + 1}", correction=True)
+                    source, destination = pairs[worst]
+                    before_corners = corners().clone()
+                    pick_xy = before_corners[source, :2].cpu().tolist()
+                    place_xy = before_corners[destination, :2].cpu().tolist()
+
+                    place_corner(
+                        source, destination,
+                        number=f"correction_{correction + 1}", correction=True,
+                    )
+
+                    after_corners = corners().clone()
+                    success = check_fold_success(
+                        after_corners, pairs, threshold=args.success_distance
+                    )
+                    reward = compute_reward(
+                        before_corners, after_corners, pairs, success=success
+                    )
+                    logger.add_step(
+                        observation={"corners": before_corners.cpu().tolist()},
+                        action={"pick": pick_xy, "place": place_xy},
+                        next_observation={"corners": after_corners.cpu().tolist()},
+                        reward=reward,
+                        success=success,
+                        done=False,
+                    )
                     result["correction_count"] += 1
+
                 phase = "evaluation"
                 hold(math.ceil(args.settle_seconds / base.physics_dt))
-                distances = pair_distances(corners(), pairs)
-                result.update(status="completed", final_distances_m=distances,
-                              final_corner_positions_w=corners().tolist(),
-                              final_rms_speed_m_s=float(torch.sqrt((as_tensor(cloth.data.nodal_vel_w)[0] ** 2).sum(-1).mean())),
-                              success=all(math.isfinite(d) and d <= args.success_distance for d in distances))
+                final_corners = corners().clone()
+                distances = pair_distances(final_corners, pairs)
+                result.update(
+                    status="completed",
+                    final_distances_m=distances,
+                    final_corner_positions_w=final_corners.tolist(),
+                    final_rms_speed_m_s=float(
+                        torch.sqrt((as_tensor(cloth.data.nodal_vel_w)[0] ** 2).sum(-1).mean())
+                    ),
+                    success=all(math.isfinite(d) and d <= args.success_distance for d in distances),
+                )
+                # Final settle happens after the last Pick & Place: make the final
+                # transition's next observation, reward and terminal status agree.
+                if logger.records:
+                    last_record = logger.records[-1]
+                    last_record["next_observation"] = {"corners": final_corners.cpu().tolist()}
+                    last_record["success"] = bool(result["success"])
+                    last_record["reward"] = float(compute_reward(
+                        torch.tensor(last_record["observation"]["corners"],
+                                     dtype=final_corners.dtype, device=final_corners.device),
+                        final_corners, pairs, success=result["success"],
+                    ))
+                    last_record["done"] = True
                 print(f"[fold] success={result['success']}, final distances={distances}", flush=True)
+                logger.save()
+                print(f"[logger] Saved trajectory to {logger.filepath}", flush=True)
+
         except BaseException as exc:
             result.update(status="error", error=f"{type(exc).__name__}: {exc}", phase=phase)
             raise
