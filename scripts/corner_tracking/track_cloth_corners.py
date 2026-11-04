@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import sys
 from pathlib import Path
 
@@ -38,6 +39,7 @@ parser.add_argument("--num_steps", type=int, default=1000)
 parser.add_argument("--print_interval", type=int, default=30)
 parser.add_argument("--movement_threshold", type=float, default=0.0005, help="Per-corner pass threshold [m]")
 parser.add_argument("--csv", type=str, default="", help="Optional CSV output path")
+parser.add_argument("--cloth_yaw", type=float, default=0.0, help="Initial cloth yaw angle [degrees]")
 add_launcher_args(parser)
 parser.set_defaults(visualizer=["kit"])
 args_cli, hydra_args = setup_preset_cli(parser)
@@ -52,11 +54,23 @@ def configure_scene():
     env_cfg.episode_length_s = 120.0
     env_cfg.scene.support_neg_y = None
     env_cfg.scene.support_pos_y = None
+    # The default Newton coupler still references the two supports above.
+    # Remove those body patterns as well so the scene can initialize without
+    # bodies that were intentionally disabled for this tracking test.
+    physics_cfg = getattr(env_cfg.sim.physics, "default", env_cfg.sim.physics)
+    solver_cfg = getattr(physics_cfg, "solver_cfg", None)
+    if solver_cfg is not None:
+        for entry in getattr(solver_cfg, "entries", ()):
+            entry.bodies = [body for body in entry.bodies if "Support" not in body]
+        for proxy in getattr(solver_cfg, "proxies", ()):
+            proxy.bodies = [body for body in proxy.bodies if "Support" not in body]
     env_cfg.scene.table.spawn.size = (1.3, 0.5, 1.05)
     env_cfg.scene.table.spawn.visible = True
     # Place the towel at the center of the table
     env_cfg.scene.deformable.init_state.pos = (0.5, 0.0, 0.012)
-    env_cfg.scene.deformable.init_state.rot = (1.0, 0.0, 0.0, 0.0)
+    half_yaw = math.radians(args_cli.cloth_yaw) * 0.5
+    # Isaac Lab 3.0 uses (x, y, z, w) quaternions.
+    env_cfg.scene.deformable.init_state.rot = (0.0, 0.0, math.sin(half_yaw), math.cos(half_yaw))
 
     towel_material = env_cfg.scene.deformable.spawn.physics_material
     towel_material.surface_thickness = 0.004
@@ -120,6 +134,8 @@ def main():
         raise ValueError("--print_interval must be positive")
     if args_cli.movement_threshold < 0.0:
         raise ValueError("--movement_threshold cannot be negative")
+    if not math.isfinite(args_cli.cloth_yaw):
+        raise ValueError("--cloth_yaw must be finite")
 
     env_cfg = configure_scene()
     with launch_simulation(env_cfg, args_cli):
@@ -136,6 +152,28 @@ def main():
 
         # Track the same vertex indices throughout the simulation
         initial_positions_w = get_corner_world_positions(initial_nodes_w, corner_indices).clone()
+        # Verify actual simulated nodes against the requested flat, rotated mesh.
+        # Movement alone can pass even when the initial rotation is incorrect.
+        width, height = env_cfg.scene.deformable.spawn.size
+        expected_xy = initial_positions_w.new_tensor(
+            ((-width / 2, -height / 2), (-width / 2, height / 2),
+             (width / 2, height / 2), (width / 2, -height / 2))
+        )
+        yaw = math.radians(args_cli.cloth_yaw)
+        rotation = initial_positions_w.new_tensor(
+            ((math.cos(yaw), -math.sin(yaw)), (math.sin(yaw), math.cos(yaw)))
+        )
+        expected_positions = initial_positions_w.new_zeros((4, 3))
+        expected_positions[:, :2] = expected_xy @ rotation.T
+        expected_positions += initial_positions_w.new_tensor(env_cfg.scene.deformable.init_state.pos) + env_origin
+        nearest_errors, nearest_indices = torch.cdist(initial_positions_w, expected_positions).min(dim=1)
+        max_error = float(nearest_errors.max().item())
+        if max_error > 1.0e-5 or torch.unique(nearest_indices).numel() != 4:
+            raise RuntimeError(
+                f"Initial corners do not match the requested flat mesh at yaw={args_cli.cloth_yaw:g} "
+                f"degrees (maximum error={max_error:.6f} m)"
+            )
+        print(f"[check] PASS: yaw={args_cli.cloth_yaw:g} degrees, four actual corners, error={max_error:.6f} m")
         verifier = CornerMotionVerifier.create(initial_positions_w)
         markers = create_corner_markers()
         marker_indices = torch.arange(4, dtype=torch.long, device=env.unwrapped.device)
