@@ -81,8 +81,11 @@ parser.add_argument("--repeats", type=int, default=5, help="Stage R: runs per se
 parser.add_argument("--jitter", type=float, default=0.03, help="Stage R/F: max cloth start shift in x and y [m]")
 parser.add_argument("--need", type=int, default=4, help="Stage R: successes needed out of --repeats")
 parser.add_argument("--folds", type=int, default=3, help="Stage F: full folds of the best setting")
-parser.add_argument("--video_stages", default="R,F",
-                    help="Stages whose successful runs are recorded to videos/ (the demo keeps only successes). '' = none")
+parser.add_argument("--video_stages", default="all",
+                    help="Stages recorded to videos/: 'all' (A,B,R,F) or e.g. 'R,F'. '' = none. Probe runs are never recorded")
+parser.add_argument("--all_videos", action=argparse.BooleanOptionalAction, default=True,
+                    help="Keep the video of failed runs too (--no-all_videos: successful runs only)")
+parser.add_argument("--no_gui", action="store_true", help="Run without the Isaac Sim window (default: window shown)")
 parser.add_argument("--video_dir", type=Path, default=REPO / "videos" / "sweep_009")
 args = parser.parse_args()
 
@@ -106,10 +109,14 @@ def command_for(params: dict, stage: str, trial_dir: Path) -> list[str]:
     cmd = [sys.executable, str(FOLD_SCRIPT)]
     for key in PARAM_KEYS:
         cmd += [f"--{key}", str(params[key])]
-    if stage in args.video_stages.split(","):
-        # The demo records every run but writes the MP4 only when its own success check passes
-        return cmd + ["--no_gui", "--video_dir", str(args.video_dir), "presets=isaacsim_physx"]
-    return cmd + ["--no_video", "--no_gui", "--video_dir", str(trial_dir), "presets=isaacsim_physx"]
+    gui = ["--no_gui"] if args.no_gui else []
+    stages = ["A", "B", "R", "F"] if args.video_stages == "all" else args.video_stages.split(",")
+    if stage in stages:
+        # One folder per run, so a video can be found from its CSV row (run_dir column)
+        video = ["--save_all_videos"] if args.all_videos else []
+        return cmd + gui + video + ["--video_dir", str(args.video_dir / f"{stage}_{run_id_of(params)}"),
+                                    "presets=isaacsim_physx"]
+    return cmd + gui + ["--no_video", "--video_dir", str(trial_dir), "presets=isaacsim_physx"]
 
 
 def flatten(result: dict) -> dict:
@@ -262,7 +269,7 @@ def check_preflight(row: dict) -> list[str]:
 
 
 def print_stage_a(rows: list[dict], meshes: list[float]) -> None:
-    print("\n[sweep] A 결과 (O = 집기 확인 통과 + 옮기는 중 안 떨어짐 + 목표 2 cm 이내, x = 실패, - = 없음)")
+    print("\n[sweep] A 결과 (O = 집어서 옮겨 놓은 뒤 모서리가 목표 2 cm 이내, x = 실패, - = 없음)")
     print("  굽힘강성 " + "".join(f"| 간격 {spacing_of(rows, m):4.1f} mm " for m in meshes))
     patterns = [pattern_of(rows, m) for m in meshes]
     for i, bend in enumerate(BEND_VALUES):

@@ -89,7 +89,9 @@ def main():
     parser.add_argument("--check_lift", type=float, default=0.06, help="Lift used to check the grasp [m] (same height as #14)")
     parser.add_argument("--check_hold_s", type=float, default=1.0, help="Hold time of the grasp check [s]")
     parser.add_argument("--check_min_rise", type=float, default=0.015, help="Corner must rise at least this much [m]")
-    parser.add_argument("--quality_max", type=float, default=0.03, help="Corner must stay within this distance of the TCP [m] (#14)")
+    parser.add_argument("--quality_max", type=float, default=0.0,
+                        help="Corner must stay within this distance of the TCP [m] (#14). 0 = off: "
+                             "the grasp only has to lift the corner; success is judged after placing")
     parser.add_argument("--retries", type=int, default=1, help="Re-grasp attempts after a failed grasp check")
     # Transport monitoring
     parser.add_argument("--slip_drift", type=float, default=0.02, help="Corner-to-TCP change counted as slip [m]")
@@ -99,6 +101,8 @@ def main():
                         help="probe: settle and report the mesh only, grasp: grasp check, "
                              "transport: first corner placed, fold: whole fold")
     parser.add_argument("--no_gui", action="store_true", help="Run without the Kit window (for sweeps)")
+    parser.add_argument("--save_all_videos", action="store_true",
+                        help="Write the MP4 for every run, failed ones included (default: successful runs only)")
     parser.add_argument("--video_dir", type=Path, default=Path(__file__).resolve().parents[2] / "videos" / "rectangular_fold")
     add_launcher_args(parser)
     if "--no_gui" not in sys.argv:
@@ -233,7 +237,8 @@ def main():
 
     with launch_simulation(cfg, args):
         env = gym.make("Isaac-Lift-Cloth-Franka", cfg=cfg)
-        gate_video_recorders(env, lambda: result["status"] == "completed" and result["success"])
+        gate_video_recorders(env, lambda: args.save_all_videos
+                             or (result["status"] == "completed" and result["success"]))
         picker = None
         try:
             env.reset()
@@ -378,7 +383,7 @@ def main():
                 corner = corners()[source]
                 rise = float(corner[2]) - start_z
                 corner_tcp = float(torch.linalg.vector_norm(corner - anchor()))
-                ok = rise >= args.check_min_rise and corner_tcp <= args.quality_max
+                ok = rise >= args.check_min_rise and (args.quality_max <= 0 or corner_tcp <= args.quality_max)
                 return {"rise_m": rise, "corner_tcp_m": corner_tcp, "ok": ok}
 
             def place_corner(source, destination, number, correction=False):
