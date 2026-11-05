@@ -29,15 +29,12 @@ from isaaclab.visualizers import VisualizerCfg
 from isaaclab.managers import EventTermCfg
 from isaaclab.utils.math import subtract_frame_transforms
 from isaaclab_tasks.utils import resolve_task_config, setup_preset_cli
-import isaaclab_tasks  # noqa: F401
+import isaaclab_tasks  
 
-# ?꾨줈?앺듃 猷⑦듃 寃쎈줈 異붽?
 project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(project_root))
 
-# 蹂댁긽 ?⑥닔? ?곗씠?????湲곕뒫 遺덈윭?ㅺ린
-from scripts.learning.reward import compute_reward, check_fold_success
-from scripts.learning.trajectory_logger import TrajectoryLogger
+from scripts.learning.demonstration_recorder import DemonstrationRecorder
 
 from a_single_point_picker import as_tensor
 from virtual_attachment_picker import create_picker, filter_gripper_contacts
@@ -133,9 +130,9 @@ def main():
 
     demo_dir = project_root / "data" / "demonstrations" / run_dir.name
 
-    logger = TrajectoryLogger(
-        demo_dir / "high_level.jsonl"
-    )
+    
+    recorder = None
+
 
     (run_dir / "config.json").write_text(json.dumps(vars(args), default=str, indent=2), encoding="utf-8")
     result = {"success": False, "status": "running", "threshold_m": args.success_distance}
@@ -331,6 +328,11 @@ def main():
                 hold(120)
                 corner_indices = detect_corner_vertex_indices(as_tensor(cloth.data.nodal_pos_w)[0])
                 pairs = rectangular_pairs(corners(), as_tensor(robot.data.root_pos_w)[0, :2])
+                recorder = DemonstrationRecorder(
+                demo_dir=demo_dir,
+                pairs=pairs,
+                success_threshold=args.success_distance,
+            )
                 result["corner_vertex_ids"] = corner_indices.tolist()
                 result["pairs"] = pairs
                 result["initial_distances_m"] = pair_distances(corners(), pairs)
@@ -346,24 +348,14 @@ def main():
                     place_corner(source, destination, number)
                     low_level_end = len(rows)
                     after_corners = corners().clone()
-                    success = check_fold_success(
-                        after_corners, pairs, threshold=args.success_distance
+                    reward, success = recorder.record_action(
+                        before_corners=before_corners,
+                        after_corners=after_corners,
+                        pick_xy=pick_xy,
+                        place_xy=place_xy,
+                        low_level_start=low_level_start,
+                        low_level_end=low_level_end,
                     )
-                    reward = compute_reward(
-                        before_corners, after_corners, pairs, success=success
-                    )
-                    logger.add_step(
-                        observation={"corners": before_corners.cpu().tolist()},
-                        action={"pick": pick_xy, "place": place_xy},
-                        next_observation={"corners": after_corners.cpu().tolist()},
-                        reward=reward,
-                        success=success,
-                        done=False,
-                    )
-
-                    logger.records[-1]["low_level_start"] = low_level_start
-                    logger.records[-1]["low_level_end"] = low_level_end
-
 
                 result["correction_count"] = 0
                 # Re-read the released cloth and correct only the worst pair.
@@ -389,22 +381,14 @@ def main():
                     )
                     low_level_end = len(rows)
                     after_corners = corners().clone()
-                    success = check_fold_success(
-                        after_corners, pairs, threshold=args.success_distance
+                    reward, success = recorder.record_action(
+                        before_corners=before_corners,
+                        after_corners=after_corners,
+                        pick_xy=pick_xy,
+                        place_xy=place_xy,
+                        low_level_start=low_level_start,
+                        low_level_end=low_level_end,
                     )
-                    reward = compute_reward(
-                        before_corners, after_corners, pairs, success=success
-                    )
-                    logger.add_step(
-                        observation={"corners": before_corners.cpu().tolist()},
-                        action={"pick": pick_xy, "place": place_xy},
-                        next_observation={"corners": after_corners.cpu().tolist()},
-                        reward=reward,
-                        success=success,
-                        done=False,
-                    )
-                    logger.records[-1]["low_level_start"] = low_level_start
-                    logger.records[-1]["low_level_end"] = low_level_end
                     result["correction_count"] += 1
 
                 phase = "evaluation"
@@ -422,21 +406,12 @@ def main():
                 )
                 # Final settle happens after the last Pick & Place: make the final
                 # transition's next observation, reward and terminal status agree.
-                if logger.records:
-                    last_record = logger.records[-1]
-                    last_record["next_observation"] = {"corners": final_corners.cpu().tolist()}
-                    last_record["success"] = bool(result["success"])
-                    last_record["reward"] = float(compute_reward(
-                        torch.tensor(last_record["observation"]["corners"],
-                                     dtype=final_corners.dtype, device=final_corners.device),
-                        final_corners, pairs, success=result["success"],
-                    ))
-                    last_record["done"] = True
+                if recorder is not None and recorder.logger.records:
+                    recorder.finalize(
+                        final_corners=final_corners,
+                        success=result["success"],
+                    )
                 print(f"[fold] success={result['success']}, final distances={distances}", flush=True)
-
-                if result["success"]:
-                    logger.save()
-                    print(f"[logger] Saved trajectory to {logger.filepath}", flush=True)
 
 
         except BaseException as exc:
@@ -458,28 +433,13 @@ def main():
                         for t, label, _, _, points, _, grasping in rows:
                             distances = pair_distances(torch.from_numpy(points), pairs)
                             writer.writerow([t, label, grasping, *distances])
-                    if result["success"]:
-                        np.savez_compressed(demo_dir / "low_level.npz",
-                                            time_s=np.array([r[0] for r in rows]),
-                                            phase=np.array([r[1] for r in rows]),
-                                            action=np.stack([r[2] for r in rows]),
-                                            joint_pos=np.stack([r[3] for r in rows]),
-                                            corners_w=np.stack([r[4] for r in rows]),
-                                            tcp_w=np.stack([r[5] for r in rows]),
-                                            grasping=np.array([r[6] for r in rows]))
-
-                        metadata = {
-                            "episode_id": run_dir.name,
-                            "success": True,
-                            "high_level_steps": len(logger.records),
-                            "low_level_steps": len(rows),
-                            "high_level_file": "high_level.jsonl",
-                            "low_level_file": "low_level.npz",
-                        }
-                        (demo_dir / "metadata.json").write_text(
-                            json.dumps(metadata, indent=2),
-                            encoding="utf-8",
+                    if result["success"] and recorder is not None:
+                        recorder.save_if_success(
+                            success=result["success"],
+                            low_level_data=rows,
+                            episode_id=run_dir.name,
                         )
+                        print(f"[logger] Saved demonstration to {demo_dir}", flush=True)
 
             if video_dir is not None and result["success"]:
                 clips = list(video_dir.glob("*.mp4"))
