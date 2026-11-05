@@ -221,27 +221,25 @@ def pick_meshes(probe_rows: list[dict]) -> list[float]:
     return picked
 
 
-def pick_boundary(rows: list[dict], meshes: list[float]) -> tuple[float | None, list[float]]:
-    """One mesh for stage B and the bend values to add there.
+def pick_boundary(rows: list[dict], meshes: list[float]) -> dict[float, list[float]]:
+    """Stage B: for each mesh, bend values to add where its result flips between neighbours.
 
-    The mesh is the coarsest one whose pattern over the bend values equals the finest
-    mesh's (results stopped changing); otherwise the finest. New bend values go between
-    neighbours where the result flips.
+    Every mesh is checked on its own, so a flip on one mesh is not hidden by another
+    mesh that fails everywhere. At most BOUNDARY_MAX new values per mesh.
     """
-    if not meshes:
-        return None, []
-    by_spacing = sorted(meshes, key=lambda m: spacing_of(rows, m))   # finest first
-    finest = by_spacing[0]
-    chosen = next(m for m in reversed(by_spacing) if pattern_of(rows, m) == pattern_of(rows, finest))
-    pattern = pattern_of(rows, chosen)
-    extra = []
-    for i in range(len(BEND_VALUES) - 1):
-        if pattern[i] is None or pattern[i + 1] is None or pattern[i] == pattern[i + 1]:
-            continue
-        low, high = BEND_VALUES[i], BEND_VALUES[i + 1]
-        ratio = (high / low) ** (1 / (BOUNDARY_POINTS + 1))
-        extra += [round(low * ratio ** k, 1) for k in range(1, BOUNDARY_POINTS + 1)]
-    return chosen, extra[:BOUNDARY_MAX]
+    plan = {}
+    for mesh in meshes:
+        pattern = pattern_of(rows, mesh)
+        extra = []
+        for i in range(len(BEND_VALUES) - 1):
+            if pattern[i] is None or pattern[i + 1] is None or pattern[i] == pattern[i + 1]:
+                continue
+            low, high = BEND_VALUES[i], BEND_VALUES[i + 1]
+            ratio = (high / low) ** (1 / (BOUNDARY_POINTS + 1))
+            extra += [round(low * ratio ** k, 1) for k in range(1, BOUNDARY_POINTS + 1)]
+        if extra:
+            plan[mesh] = extra[:BOUNDARY_MAX]
+    return plan
 
 
 def rank(rows: list[dict]) -> list[dict]:
@@ -345,7 +343,7 @@ def main() -> None:
             print(f"[sweep] 로그 파일: {log_dir / (row['run_id'] + '.log')}")
             sys.exit(1)
         append_row(csv_path, row)
-        remaining = len(grid) - 1 + BOUNDARY_MAX + args.top * args.repeats + args.folds * 2
+        remaining = len(grid) - 1 + BOUNDARY_MAX * len(meshes) +args.top * args.repeats + args.folds * 2
         hours = remaining * float(row["duration_s"]) / 3600
         print(f"[sweep] 점검 통과 (1회 {row['duration_s']}초, 가장 촘촘한 메시 기준, 결과 {row['result_status']}).")
         print(f"[sweep] 이제 자리를 비워도 됩니다. 남은 실행 최대 약 {remaining}회, 최대 약 {hours:.1f}시간 예상.")
@@ -353,14 +351,17 @@ def main() -> None:
     run_all(grid, "A")
     print_stage_a(rows_now(), meshes)
 
-    chosen, extra = pick_boundary(rows_now(), meshes)
-    if chosen is not None and extra:
-        print(f"\n[sweep] B: refinement {chosen:g}에서 결과가 바뀌는 구간에 굽힘 강성 {extra} 추가")
-        run_all([setting(b, chosen) for b in extra], "B")
+    plan = pick_boundary(rows_now(), meshes)
+    if plan:
+        for mesh, extra in plan.items():
+            print(f"\n[sweep] B: 정점 간격 {spacing_of(rows_now(), mesh):.1f} mm (refinement {mesh:g})에서 "
+                  f"결과가 바뀌는 구간에 굽힘 강성 {extra} 추가")
+            run_all([setting(b, mesh) for b in extra], "B")
     else:
-        print("\n[sweep] B: 결과가 바뀌는 구간이 없어 건너뜁니다 (전부 성공 또는 전부 실패)")
+        print("\n[sweep] B: 어느 메시에도 결과가 바뀌는 구간이 없어 건너뜁니다 (전부 성공 또는 전부 실패)")
 
-    ranked = [r for r in rank(rows_now()) if chosen is None or float(r["mesh_refinement"]) == chosen]
+    # All meshes compete: successes first, then smallest place error (see rank)
+    ranked = rank(rows_now())
     top = ranked[: args.top]
     if not top:
         print("\n[sweep] 집기 확인을 통과한 설정이 없어 R, F는 건너뜁니다.")
