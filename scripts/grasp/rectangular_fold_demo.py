@@ -1,4 +1,4 @@
-
+﻿
 """Sequential rectangular cloth fold with one virtual gripper.
 
 Run with the Isaac Lab launcher; see README_rectangular_fold.md.
@@ -31,11 +31,11 @@ from isaaclab.utils.math import subtract_frame_transforms
 from isaaclab_tasks.utils import resolve_task_config, setup_preset_cli
 import isaaclab_tasks  # noqa: F401
 
-# 프로젝트 루트 경로 추가
+# ?꾨줈?앺듃 猷⑦듃 寃쎈줈 異붽?
 project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(project_root))
 
-# 보상 함수와 데이터 저장 기능 불러오기
+# 蹂댁긽 ?⑥닔? ?곗씠?????湲곕뒫 遺덈윭?ㅺ린
 from scripts.learning.reward import compute_reward, check_fold_success
 from scripts.learning.trajectory_logger import TrajectoryLogger
 
@@ -130,9 +130,13 @@ def main():
 
     run_dir = args.video_dir.resolve() / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     run_dir.mkdir(parents=True, exist_ok=False)
+
+    demo_dir = project_root / "data" / "demonstrations" / run_dir.name
+
     logger = TrajectoryLogger(
-        project_root / "data" / "demonstrations" / f"{run_dir.name}.jsonl"
+        demo_dir / "high_level.jsonl"
     )
+
     (run_dir / "config.json").write_text(json.dumps(vars(args), default=str, indent=2), encoding="utf-8")
     result = {"success": False, "status": "running", "threshold_m": args.success_distance}
     rows = []
@@ -334,12 +338,13 @@ def main():
 
                 # Record each high-level Pick & Place without changing the fold controller.
                 for number, (source, destination) in enumerate(pairs, 1):
+                    low_level_start = len(rows)
                     before_corners = corners().clone()
                     pick_xy = before_corners[source, :2].cpu().tolist()
                     place_xy = before_corners[destination, :2].cpu().tolist()
 
                     place_corner(source, destination, number)
-
+                    low_level_end = len(rows)
                     after_corners = corners().clone()
                     success = check_fold_success(
                         after_corners, pairs, threshold=args.success_distance
@@ -355,6 +360,10 @@ def main():
                         success=success,
                         done=False,
                     )
+
+                    logger.records[-1]["low_level_start"] = low_level_start
+                    logger.records[-1]["low_level_end"] = low_level_end
+
 
                 result["correction_count"] = 0
                 # Re-read the released cloth and correct only the worst pair.
@@ -369,6 +378,7 @@ def main():
                     worst = max(range(len(pairs)), key=distances.__getitem__)
                     print(f"[fold] correction {correction + 1}: pair={worst}, error={distances[worst]:.4f} m", flush=True)
                     source, destination = pairs[worst]
+                    low_level_start = len(rows)
                     before_corners = corners().clone()
                     pick_xy = before_corners[source, :2].cpu().tolist()
                     place_xy = before_corners[destination, :2].cpu().tolist()
@@ -377,7 +387,7 @@ def main():
                         source, destination,
                         number=f"correction_{correction + 1}", correction=True,
                     )
-
+                    low_level_end = len(rows)
                     after_corners = corners().clone()
                     success = check_fold_success(
                         after_corners, pairs, threshold=args.success_distance
@@ -393,6 +403,8 @@ def main():
                         success=success,
                         done=False,
                     )
+                    logger.records[-1]["low_level_start"] = low_level_start
+                    logger.records[-1]["low_level_end"] = low_level_end
                     result["correction_count"] += 1
 
                 phase = "evaluation"
@@ -421,8 +433,11 @@ def main():
                     ))
                     last_record["done"] = True
                 print(f"[fold] success={result['success']}, final distances={distances}", flush=True)
-                logger.save()
-                print(f"[logger] Saved trajectory to {logger.filepath}", flush=True)
+
+                if result["success"]:
+                    logger.save()
+                    print(f"[logger] Saved trajectory to {logger.filepath}", flush=True)
+
 
         except BaseException as exc:
             result.update(status="error", error=f"{type(exc).__name__}: {exc}", phase=phase)
@@ -444,7 +459,7 @@ def main():
                             distances = pair_distances(torch.from_numpy(points), pairs)
                             writer.writerow([t, label, grasping, *distances])
                     if result["success"]:
-                        np.savez_compressed(run_dir / "demonstration.npz",
+                        np.savez_compressed(demo_dir / "low_level.npz",
                                             time_s=np.array([r[0] for r in rows]),
                                             phase=np.array([r[1] for r in rows]),
                                             action=np.stack([r[2] for r in rows]),
@@ -452,6 +467,20 @@ def main():
                                             corners_w=np.stack([r[4] for r in rows]),
                                             tcp_w=np.stack([r[5] for r in rows]),
                                             grasping=np.array([r[6] for r in rows]))
+
+                        metadata = {
+                            "episode_id": run_dir.name,
+                            "success": True,
+                            "high_level_steps": len(logger.records),
+                            "low_level_steps": len(rows),
+                            "high_level_file": "high_level.jsonl",
+                            "low_level_file": "low_level.npz",
+                        }
+                        (demo_dir / "metadata.json").write_text(
+                            json.dumps(metadata, indent=2),
+                            encoding="utf-8",
+                        )
+
             if video_dir is not None and result["success"]:
                 clips = list(video_dir.glob("*.mp4"))
                 if not clips or not all(clip.stat().st_size > 0 for clip in clips):
