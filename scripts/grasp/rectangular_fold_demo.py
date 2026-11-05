@@ -396,6 +396,8 @@ def main():
                     safe[2] = max(float(safe[2]), float(above[2]))
                     move(safe, 120)
                     move(above, goal_quat_w=action.new_tensor((1.0, 0.0, 0.0, 0.0)))
+                    # Gap in free air, to tell "never opened fully" from "squeezed while descending"
+                    record["open_gap_above_m"] = float(as_tensor(robot.data.joint_pos)[0, finger_ids].sum())
                     phase = f"{number}_descend"
                     touch = grasp_target(source)
                     # Virtual: stop 1.5 cm above the corner. Physical: fingertips on the cloth (blocked by the table)
@@ -454,7 +456,12 @@ def main():
                         offset = picker.target_position_w - anchor()
                     goal = corners()[destination].clone() - offset
                     goal[2] += max(0.003, args.cloth_thickness + 0.001)
-                    move(goal, 120)
+                    # Physical: fingers collide with the cloth layers under them, so the TCP cannot
+                    # reach this height. Go as low as possible; success is judged by the corner
+                    # distance after release, not by the TCP height.
+                    move(goal, 120, strict=not physical)
+                    if physical:
+                        record["lower_error_m"] = float(torch.linalg.vector_norm(anchor() - goal))
                 phase = f"{number}_release"
                 record["max_drift_m"] = transport["max_drift_m"]
                 set_gripper(closed=False)

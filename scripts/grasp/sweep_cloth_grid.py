@@ -65,8 +65,8 @@ BOUNDARY_MAX = 10
 PARAM_KEYS = [*FIXED, "bend_stiffness", "mesh_refinement", "seed", "pos_jitter", "stop_after"]
 RESULT_KEYS = [
     "result_status", "success", "fail_phase", "mesh_node_count", "spacing_mm",
-    "grasp_ok", "grasp_attempts", "open_gap_mm", "rise_mm", "corner_tcp_mm",
-    "max_drift_mm", "slip_phase", "place_error_mm", "applied_size_mm", "applied_bend", "run_dir",
+    "grasp_ok", "grasp_attempts", "open_gap_above_mm", "open_gap_mm", "rise_mm", "corner_tcp_mm",
+    "max_drift_mm", "slip_phase", "place_error_mm", "lower_error_mm", "applied_size_mm", "applied_bend", "run_dir",
 ]
 CSV_FIELDS = ["run_id", "stage", "status", "duration_s", *PARAM_KEYS, *RESULT_KEYS]
 
@@ -74,6 +74,8 @@ parser = argparse.ArgumentParser(description="Cloth unification grid (physical g
 parser.add_argument("--out", type=Path, default=REPO / "logs" / "sweep_009", help="Folder for results.csv and run logs")
 parser.add_argument("--timeout", type=float, default=1800.0, help="Seconds before a stuck run is killed")
 parser.add_argument("--retry_failed", action="store_true", help="Run ERROR/TIMEOUT runs again")
+parser.add_argument("--min_spacing_mm", type=float, default=4.0,
+                    help="Skip meshes finer than this (finer ones overflowed the PhysX contact buffer)")
 parser.add_argument("--top", type=int, default=3, help="Stage R: how many settings to repeat")
 parser.add_argument("--repeats", type=int, default=5, help="Stage R: runs per setting (seeds 1..N)")
 parser.add_argument("--jitter", type=float, default=0.03, help="Stage R/F: max cloth start shift in x and y [m]")
@@ -122,6 +124,7 @@ def flatten(result: dict) -> dict:
         "fail_phase": result.get("phase"), "mesh_node_count": result.get("mesh_node_count"),
         "spacing_mm": None if result.get("spacing_mm") is None else round(result["spacing_mm"], 3),
         "grasp_ok": first.get("ok"), "grasp_attempts": first.get("attempts"),
+        "open_gap_above_mm": mm(first.get("open_gap_above_m")), "lower_error_mm": mm(first.get("lower_error_m")),
         "open_gap_mm": mm(first.get("open_gap_m")), "rise_mm": mm(first.get("rise_m")),
         "corner_tcp_mm": mm(first.get("corner_tcp_m")), "max_drift_mm": mm(result.get("max_drift_m")),
         "slip_phase": result.get("slip_phase"), "place_error_mm": mm(distances[0]) if distances else None,
@@ -158,6 +161,13 @@ def run_one(params: dict, stage: str, log_dir: Path) -> dict:
 
 
 def append_row(csv_path: Path, row: dict) -> None:
+    if csv_path.exists():
+        with csv_path.open(encoding="utf-8", newline="") as f:
+            header = next(csv.reader(f), [])
+        if header != CSV_FIELDS:   # written by an older version: keep it aside, start a new table
+            old = csv_path.with_name(csv_path.stem + "_old.csv")
+            csv_path.replace(old)
+            print(f"[sweep] 열 구성이 바뀌어 기존 결과를 {old.name}으로 옮겼습니다")
     new_file = not csv_path.exists()
     with csv_path.open("a", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
@@ -191,7 +201,9 @@ def pattern_of(rows: list[dict], mesh: float) -> list[bool | None]:
 
 def pick_meshes(probe_rows: list[dict]) -> list[float]:
     """Refinements whose real vertex spacing is closest to each target, without duplicates."""
-    ok = [r for r in probe_rows if r["status"] == "OK" and r["spacing_mm"]]
+    # Finer meshes overflow the PhysX deformable contact buffer (seen at 2.34 mm / 16641 nodes)
+    ok = [r for r in probe_rows if r["status"] == "OK" and r["spacing_mm"]
+          and float(r["spacing_mm"]) >= args.min_spacing_mm]
     picked, seen_nodes = [], set()
     for target in TARGET_SPACINGS_MM:
         best = min(ok, key=lambda r: abs(float(r["spacing_mm"]) - target), default=None)
@@ -243,8 +255,9 @@ def check_preflight(row: dict) -> list[str]:
         problems.append(f"천 크기가 {row['applied_size_mm']} mm로 적용됐습니다. {FIXED['cloth_size'] * 1000:.0f} mm여야 합니다")
     if row["applied_bend"] and abs(float(row["applied_bend"]) - float(row["bend_stiffness"])) > 1e-3:
         problems.append(f"굽힘 강성이 {row['applied_bend']}로 적용됐습니다. 요청값은 {row['bend_stiffness']}입니다")
-    if row["open_gap_mm"] and abs(float(row["open_gap_mm"]) - FIXED["open_width"] * 1000) > 2.0:
-        problems.append(f"닫기 직전 손가락 간격이 {row['open_gap_mm']} mm입니다. {FIXED['open_width'] * 1000:.0f} mm여야 합니다")
+    # Checked in free air above the cloth; just before closing the fingers may already touch the cloth
+    if row["open_gap_above_mm"] and abs(float(row["open_gap_above_mm"]) - FIXED["open_width"] * 1000) > 2.0:
+        problems.append(f"천 위 공중에서 손가락 간격이 {row['open_gap_above_mm']} mm입니다. {FIXED['open_width'] * 1000:.0f} mm여야 합니다")
     return problems
 
 
