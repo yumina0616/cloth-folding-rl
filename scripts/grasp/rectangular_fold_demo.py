@@ -93,6 +93,10 @@ def main():
                         help="Corner must stay within this distance of the TCP [m] (#14). 0 = off: "
                              "the grasp only has to lift the corner; success is judged after placing")
     parser.add_argument("--retries", type=int, default=1, help="Re-grasp attempts after a failed grasp check")
+    parser.add_argument("--place_mode", choices=["mirror", "live"], default="mirror",
+                        help="Physical grasp: where the hand goes when placing. mirror = the point where the destination "
+                             "corner would be pinched (the held corner lands on it); live = destination minus the "
+                             "measured corner-to-hand offset (old behaviour, kept for comparison)")
     parser.add_argument("--grasp_yaw_deg", type=float, default=90.0,
                         help="Physical grasp only: hand rotation about world z (multiple of 90). "
                              "0 = jaw closes along world y, 90 = along world x (the fold direction)")
@@ -209,7 +213,7 @@ def main():
     applied = {"cloth_size": float(cfg.scene.deformable.spawn.size[0]), "density": material.density,
                "youngs_modulus": material.youngs_modulus, "bend_stiffness": material.surface_bend_stiffness,
                "cloth_friction": material.dynamic_friction,
-               "hand_yaw_deg": args.hand_yaw_deg, "jaw_axis": args.jaw_axis,
+               "hand_yaw_deg": args.hand_yaw_deg, "jaw_axis": args.jaw_axis, "place_mode": args.place_mode,
                "open_command": cfg.actions.gripper_action.open_command_expr}
     result = {"success": False, "status": "running", "threshold_m": args.success_distance, "applied": applied,
               "grasp_mode": args.grasp_mode, "stop_after": args.stop_after,
@@ -463,6 +467,10 @@ def main():
                 # pulled the far edge away and exceeded the robot workspace.
                 offset = picker.target_position_w - anchor()
                 start_node = corners()[source].clone()
+                # mirror: the hand ends where it would pinch the destination corner (the grasp point is
+                # mirrored by the fold), so the held corner lands on the destination instead of overshooting it.
+                mirror = physical and args.place_mode == "mirror"
+                tcp_start_xy = anchor()[:2].clone()
                 initial_span = float(torch.linalg.vector_norm(corners()[destination, :2] - start_node[:2]))
                 arc_height = (max(0.008, min(args.lift_height, initial_span / 2)) if correction
                                   else max(args.lift_height, initial_span / 2))
@@ -475,13 +483,18 @@ def main():
                     destination_now = corners()[destination].clone()
                     node_goal = torch.lerp(start_node, destination_now, alpha)
                     node_goal[2] += arc_height * math.sin(math.pi * t) + max(0.003, args.cloth_thickness + 0.001) * alpha
-                    move(node_goal - offset, 60 if correction else 120)
+                    goal = node_goal - offset
+                    if mirror:
+                        goal[:2] = torch.lerp(tcp_start_xy, grasp_target(destination)[:2], alpha)
+                    move(goal, 60 if correction else 120)
                 phase = f"{number}_lower"
                 for _ in range(3):
                     if physical:
                         offset = picker.target_position_w - anchor()
                     goal = corners()[destination].clone() - offset
                     goal[2] += max(0.003, args.cloth_thickness + 0.001)
+                    if mirror:
+                        goal[:2] = grasp_target(destination)[:2]
                     # Physical: fingers collide with the cloth layers under them, so the TCP cannot
                     # reach this height. Go as low as possible; success is judged by the corner
                     # distance after release, not by the TCP height.
@@ -490,13 +503,23 @@ def main():
                         record["lower_error_m"] = float(torch.linalg.vector_norm(anchor() - goal))
                 phase = f"{number}_release"
                 record["max_drift_m"] = transport["max_drift_m"]
+
+                def placed_error_mm():
+                    """Signed xy of (held corner - destination corner) in mm: where the miss comes from."""
+                    return [round(float(v) * 1000, 1) for v in (corners()[source] - corners()[destination])[:2]]
+
+                record["err_before_open_mm"] = placed_error_mm()
                 set_gripper(closed=False)
+                record["err_after_open_mm"] = placed_error_mm()
                 picker.release()
                 phase = f"{number}_retreat"
                 retreat = anchor().clone()
                 retreat[2] += 0.10
                 move(retreat, 180)
                 hold(math.ceil(args.settle_seconds / base.physics_dt))
+                record["err_settled_mm"] = placed_error_mm()
+                print(f"[fold] placement {number} corner error mm (x,y): before open={record['err_before_open_mm']}, "
+                      f"after open={record['err_after_open_mm']}, settled={record['err_settled_mm']}", flush=True)
                 print(f"[fold] after placement {number}: distances={pair_distances(corners(), pairs)}", flush=True)
 
 
