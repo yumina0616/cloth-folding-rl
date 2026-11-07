@@ -17,21 +17,24 @@ def as_tensor(value):
     return value if isinstance(value, torch.Tensor) else value.torch
 
 
-def physical_grasp_xy(corner_xy, center_xy, open_width, *, pad_half=0.01, edge_margin=0.005):
+def physical_grasp_xy(corner_xy, center_xy, open_width, *, pad_half=0.01, edge_margin=0.005, jaw_axis="y"):
     """Grasp point near a corner so that both open fingertips land on the cloth.
 
-    The jaw closes along world y, so the fingers spread only in y: y needs room for
-    half the open gap plus a pad, x only for the pad (008 "axis" layout).
+    The fingers spread only along the jaw axis (world "x" or "y"): that axis needs room
+    for half the open gap plus a pad, the other axis only for the pad (008 "axis" layout).
     Assumes the cloth edges are aligned with world x and y (no cloth rotation).
     """
     if not math.isfinite(open_width) or open_width <= 0:
         raise ValueError("open_width must be positive and finite")
+    if jaw_axis not in ("x", "y"):
+        raise ValueError("jaw_axis must be 'x' or 'y'")
     pad_room = pad_half + edge_margin
     jaw_room = open_width / 2 + pad_room
     toward_center = torch.sign(center_xy - corner_xy)
     if bool((toward_center == 0).any()):
         raise ValueError("Cloth center must differ from the corner in both x and y")
-    return corner_xy + toward_center * corner_xy.new_tensor((pad_room, jaw_room))
+    room = (pad_room, jaw_room) if jaw_axis == "y" else (jaw_room, pad_room)
+    return corner_xy + toward_center * corner_xy.new_tensor(room)
 
 
 class PhysicalPicker:

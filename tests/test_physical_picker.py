@@ -28,6 +28,13 @@ class GraspPointTest(unittest.TestCase):
         xy = physical_grasp_xy(torch.tensor([0.0, 0.0]), torch.tensor([0.15, 0.15]), 0.04)
         self.assertTrue(torch.allclose(xy, torch.tensor([0.015, 0.035])))
 
+    def test_jaw_along_x_swaps_the_room(self):
+        # Jaw along the fold direction (world x): x = 20 + 15 = 35 mm, y = pad 15 mm
+        xy = physical_grasp_xy(torch.tensor([0.0, 0.0]), torch.tensor([0.15, 0.15]), 0.04, jaw_axis="x")
+        self.assertTrue(torch.allclose(xy, torch.tensor([0.035, 0.015])))
+        with self.assertRaises(ValueError):
+            physical_grasp_xy(torch.tensor([0.0, 0.0]), torch.tensor([0.15, 0.15]), 0.04, jaw_axis="z")
+
     def test_other_corner_points_inward(self):
         xy = physical_grasp_xy(torch.tensor([0.3, 0.3]), torch.tensor([0.15, 0.15]), 0.04)
         self.assertTrue(torch.allclose(xy, torch.tensor([0.285, 0.265])))

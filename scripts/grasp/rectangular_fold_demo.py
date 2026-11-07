@@ -93,6 +93,9 @@ def main():
                         help="Corner must stay within this distance of the TCP [m] (#14). 0 = off: "
                              "the grasp only has to lift the corner; success is judged after placing")
     parser.add_argument("--retries", type=int, default=1, help="Re-grasp attempts after a failed grasp check")
+    parser.add_argument("--grasp_yaw_deg", type=float, default=90.0,
+                        help="Physical grasp only: hand rotation about world z (multiple of 90). "
+                             "0 = jaw closes along world y, 90 = along world x (the fold direction)")
     # Transport monitoring
     parser.add_argument("--slip_drift", type=float, default=0.02, help="Corner-to-TCP change counted as slip [m]")
     parser.add_argument("--drop_height", type=float, default=0.01, help="Corner below this height above the table while carried = dropped [m]")
@@ -120,6 +123,10 @@ def main():
         parser.error("Cloth pose must be finite")
     if args.grasp_mode == "physical" and args.cloth_yaw_deg != 0.0:
         parser.error("Physical grasp assumes an unrotated cloth (the jaw closes along world y)")
+    if not math.isfinite(args.grasp_yaw_deg) or args.grasp_yaw_deg % 90 != 0:
+        parser.error("grasp_yaw_deg must be a multiple of 90")
+    args.hand_yaw_deg = args.grasp_yaw_deg if args.grasp_mode == "physical" else 0.0
+    args.jaw_axis = "y" if args.hand_yaw_deg % 180 == 0 else "x"
     rng = random.Random(args.seed)
     args.start_x = args.cloth_x + rng.uniform(-args.pos_jitter, args.pos_jitter)
     args.start_y = args.cloth_y + rng.uniform(-args.pos_jitter, args.pos_jitter)
@@ -202,6 +209,7 @@ def main():
     applied = {"cloth_size": float(cfg.scene.deformable.spawn.size[0]), "density": material.density,
                "youngs_modulus": material.youngs_modulus, "bend_stiffness": material.surface_bend_stiffness,
                "cloth_friction": material.dynamic_friction,
+               "hand_yaw_deg": args.hand_yaw_deg, "jaw_axis": args.jaw_axis,
                "open_command": cfg.actions.gripper_action.open_command_expr}
     result = {"success": False, "status": "running", "threshold_m": args.success_distance, "applied": applied,
               "grasp_mode": args.grasp_mode, "stop_after": args.stop_after,
@@ -258,6 +266,7 @@ def main():
             finger_ids = robot.find_joints("panda_finger_joint.*")[0]
             if len(finger_ids) != 2:
                 raise RuntimeError("Expected two Franka finger joints for gripper verification")
+            finger_body_ids = robot.find_bodies("panda_.*finger")[0]
             anchor = lambda: as_tensor(ee.data.target_pos_w)[0, 0]
             # The physical grasp point is about 4 cm from the corner, so its reach check uses the picker default (6 cm)
             picker = (create_picker(cloth, anchor, grasp_mode="physical") if args.grasp_mode == "physical"
@@ -267,6 +276,9 @@ def main():
                 raise RuntimeError(f"Expected absolute pose IK action (1, 8), got {action.shape}")
             target_w = anchor().clone()
             target_quat_w = as_tensor(ee.data.target_quat_w)[0, 0].clone()
+            # Hand pose used for the approach: identity, rotated about world z (the gripper is 180 deg symmetric)
+            half_yaw_hand = math.radians(args.hand_yaw_deg) / 2
+            grasp_quat = action.new_tensor((math.cos(half_yaw_hand), 0.0, 0.0, math.sin(half_yaw_hand)))
 
             def set_pose(position_w, quaternion_w):
                 # Absolute IK actions are expressed in the robot ROOT frame,
@@ -368,7 +380,8 @@ def main():
                 if physical:
                     center_xy = corners()[:, :2].mean(dim=0)
                     corner[:2] = physical_grasp_xy(corner[:2], center_xy, args.open_width,
-                                                   pad_half=args.pad_half, edge_margin=args.edge_margin)
+                                                   pad_half=args.pad_half, edge_margin=args.edge_margin,
+                                                   jaw_axis=args.jaw_axis)
                 return corner
 
             def grasp_check(source, number):
@@ -400,9 +413,15 @@ def main():
                     safe = anchor().clone()
                     safe[2] = max(float(safe[2]), float(above[2]))
                     move(safe, 120)
-                    move(above, goal_quat_w=action.new_tensor((1.0, 0.0, 0.0, 0.0)))
+                    move(above, goal_quat_w=grasp_quat)
                     # Gap in free air, to tell "never opened fully" from "squeezed while descending"
                     record["open_gap_above_m"] = float(as_tensor(robot.data.joint_pos)[0, finger_ids].sum())
+                    if len(finger_body_ids) == 2:
+                        # World vector between the two fingers: its larger component is the real jaw axis
+                        fingers = as_tensor(robot.data.body_pos_w)[0, finger_body_ids]
+                        record["finger_vec_open_mm"] = [round(float(v) * 1000, 1) for v in fingers[0] - fingers[1]]
+                        print(f"[fold] finger vector (open, world) mm={record['finger_vec_open_mm']}, "
+                              f"expected jaw axis={args.jaw_axis}", flush=True)
                     phase = f"{number}_descend"
                     touch = grasp_target(source)
                     # Virtual: stop 1.5 cm above the corner. Physical: fingertips on the cloth (blocked by the table)
