@@ -93,6 +93,8 @@ def main():
                         help="Corner must stay within this distance of the TCP [m] (#14). 0 = off: "
                              "the grasp only has to lift the corner; success is judged after placing")
     parser.add_argument("--retries", type=int, default=1, help="Re-grasp attempts after a failed grasp check")
+    parser.add_argument("--stack_check_lift", action="store_true",
+                        help="Old behaviour: build the carry arc on top of the height the grasp check lifted to")
     # Transport monitoring
     parser.add_argument("--slip_drift", type=float, default=0.02, help="Corner-to-TCP change counted as slip [m]")
     parser.add_argument("--drop_height", type=float, default=0.01, help="Corner below this height above the table while carried = dropped [m]")
@@ -201,7 +203,7 @@ def main():
     (run_dir / "config.json").write_text(json.dumps(vars(args), default=str, indent=2), encoding="utf-8")
     applied = {"cloth_size": float(cfg.scene.deformable.spawn.size[0]), "density": material.density,
                "youngs_modulus": material.youngs_modulus, "bend_stiffness": material.surface_bend_stiffness,
-               "cloth_friction": material.dynamic_friction,
+               "cloth_friction": material.dynamic_friction, "stack_check_lift": args.stack_check_lift,
                "open_command": cfg.actions.gripper_action.open_command_expr}
     result = {"success": False, "status": "running", "threshold_m": args.success_distance, "applied": applied,
               "grasp_mode": args.grasp_mode, "stop_after": args.stop_after,
@@ -442,6 +444,12 @@ def main():
                 # pulled the far edge away and exceeded the robot workspace.
                 offset = picker.target_position_w - anchor()
                 start_node = corners()[source].clone()
+                # The grasp check already lifted the corner by rise_m. Build the arc from the height the
+                # corner had before that lift, so the check is only a prefix of the carry and the arc is
+                # not stacked on top of it (same path as a run without the check).
+                arc_start = start_node.clone()
+                if physical and not args.stack_check_lift:
+                    arc_start[2] -= record.get("rise_m", 0.0)
                 initial_span = float(torch.linalg.vector_norm(corners()[destination, :2] - start_node[:2]))
                 arc_height = (max(0.008, min(args.lift_height, initial_span / 2)) if correction
                                   else max(args.lift_height, initial_span / 2))
@@ -452,7 +460,7 @@ def main():
                     t = segment / 8
                     alpha = (1 - math.cos(math.pi * t)) / 2
                     destination_now = corners()[destination].clone()
-                    node_goal = torch.lerp(start_node, destination_now, alpha)
+                    node_goal = torch.lerp(arc_start, destination_now, alpha)
                     node_goal[2] += arc_height * math.sin(math.pi * t) + max(0.003, args.cloth_thickness + 0.001) * alpha
                     move(node_goal - offset, 60 if correction else 120)
                 phase = f"{number}_lower"
