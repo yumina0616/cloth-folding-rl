@@ -35,6 +35,7 @@ import isaaclab_tasks  # noqa: F401
 from a_single_point_picker import as_tensor
 from virtual_attachment_picker import filter_gripper_contacts
 from physical_picker import create_picker, physical_grasp_xy
+from finger_pad_probe import probe_finger_pads
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "corner_tracking"))
 from cloth_corner_tracker import detect_corner_vertex_indices, get_corner_world_positions
 from rectangular_fold_geometry import rectangular_pairs, pair_distances
@@ -428,6 +429,10 @@ def main():
                         record["finger_vec_open_mm"] = [round(float(v) * 1000, 1) for v in fingers[0] - fingers[1]]
                         print(f"[fold] finger vector (open, world) mm={record['finger_vec_open_mm']}, "
                               f"expected jaw axis={args.jaw_axis}", flush=True)
+                    if "finger_pad_probe" not in result:
+                        # Pad size from the collision geometry (once per run); replaces the pad_half estimate
+                        result["finger_pad_probe"] = probe_finger_pads()
+                        print(f"[fold] finger pad probe: {json.dumps(result['finger_pad_probe'])}", flush=True)
                     phase = f"{number}_descend"
                     touch = grasp_target(source)
                     # Virtual: stop 1.5 cm above the corner. Physical: fingertips on the cloth (blocked by the table)
