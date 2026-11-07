@@ -220,6 +220,7 @@ def main():
     step_index = 0
     corner_indices = None
     pairs = None
+    initial_center_xy = None  # centre of the four corners while the cloth is still flat
     video_dir = None
     if args.video:
         from isaaclab.envs.utils.video_recorder_cfg import VideoRecorderCfg
@@ -378,8 +379,9 @@ def main():
                 """Where the TCP goes down: the corner itself (virtual) or the 008 point near it (physical)."""
                 corner = corners()[source].clone()
                 if physical:
-                    center_xy = corners()[:, :2].mean(dim=0)
-                    corner[:2] = physical_grasp_xy(corner[:2], center_xy, args.open_width,
+                    # Inward = toward the cloth body as it lay flat. The current corner mean would collapse
+                    # onto the fold edge after folding, so its sign (and the inward direction) is unstable.
+                    corner[:2] = physical_grasp_xy(corner[:2], initial_center_xy, args.open_width,
                                                    pad_half=args.pad_half, edge_margin=args.edge_margin,
                                                    jaw_axis=args.jaw_axis)
                 return corner
@@ -502,6 +504,8 @@ def main():
                 hold(120)
                 corner_indices = detect_corner_vertex_indices(as_tensor(cloth.data.nodal_pos_w)[0])
                 pairs = rectangular_pairs(corners(), as_tensor(robot.data.root_pos_w)[0, :2])
+                initial_center_xy = corners()[:, :2].mean(dim=0).clone()
+                result["initial_center_xy"] = initial_center_xy.tolist()
                 result["corner_vertex_ids"] = corner_indices.tolist()
                 result["pairs"] = pairs
                 result["initial_distances_m"] = pair_distances(corners(), pairs)
