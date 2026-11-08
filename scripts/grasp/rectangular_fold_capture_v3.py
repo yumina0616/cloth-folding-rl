@@ -46,7 +46,7 @@ from cloth_corner_tracker import detect_corner_vertex_indices, get_corner_world_
 from rectangular_fold_geometry import rectangular_pairs, pair_distances
 from successful_video import gate_video_recorders
 from towel_visual import TowelVisual
-def filter_gripper_contacts_event(env, env_ids=None):
+def filter_gripper_contacts_event(env, env_ids):
     """Isaac Lab event callback for virtual grasp collision filtering."""
     return filter_gripper_contacts(env)
 
@@ -136,7 +136,7 @@ def main():
             focal_length=18.0, horizontal_aperture=20.955, clipping_range=(0.02, 10.0)),
         offset=CameraCfg.OffsetCfg(
             pos=(0.0, 0.04, 0.07),
-            rot=(0.0, 0.0, 0.0, 1.0), convention="opengl"),
+            rot=(1.0, 0.0, 0.0, 0.0), convention="opengl"),
     )
     # update() is called once per env.step, so step at the physics frequency.
     cfg.decimation = 1
