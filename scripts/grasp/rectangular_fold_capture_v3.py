@@ -444,7 +444,7 @@ def main():
             def corners():
                 return get_corner_world_positions(as_tensor(cloth.data.nodal_pos_w)[0], corner_indices)
 
-            def move(goal_w, count=240, goal_quat_w=None):
+            def move(goal_w, count=240, goal_quat_w=None, midpoint_callback=None):
                 nonlocal target_w, target_quat_w
                 start = target_w.clone()
                 start_quat = target_quat_w.clone()
@@ -458,6 +458,9 @@ def main():
                     quat = quat / torch.linalg.vector_norm(quat)
                     set_pose(torch.lerp(start, goal_w, alpha), quat)
                     step()
+
+                    if midpoint_callback is not None and i == count // 2:
+                        midpoint_callback()
                 target_w = goal_w.clone()
                 target_quat_w = goal_quat
                 # Fixed-duration interpolation alone does not guarantee arrival.
@@ -486,9 +489,16 @@ def main():
                 phase = f"{number}_descend"
                 touch = corners()[source].clone()
                 touch[2] += 0.015
-                move(touch, 180)
                 if not correction:
-                    save_camera_sample("descend", source, destination)
+                    move(
+                        touch,
+                        180,
+                        midpoint_callback=lambda: save_camera_sample(
+                            "descend", source, destination
+                        ),
+                    )
+                else:
+                    move(touch, 180)
                 phase = f"{number}_grasp"
                 set_gripper(closed=True)
                 current = corners()[source].clone()
