@@ -133,9 +133,9 @@ def main():
         data_types=["rgb"],
         update_latest_camera_pose=True,
         spawn=sim_utils.PinholeCameraCfg(
-            focal_length=18.0, horizontal_aperture=20.955, clipping_range=(0.02, 10.0)),
+            focal_length=14.0, horizontal_aperture=20.955, clipping_range=(0.02, 10.0)),
         offset=CameraCfg.OffsetCfg(
-            pos=(0.0, 0.04, 0.07),
+            pos=(0.0, 0.04, -0.01),
             rot=(1.0, 0.0, 0.0, 0.0), convention="opengl"),
     )
     # update() is called once per env.step, so step at the physics frequency.
