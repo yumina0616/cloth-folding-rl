@@ -148,6 +148,8 @@ def main():
     cfg.scene.deformable.init_state.rot = (math.cos(half_yaw), 0.0, 0.0, math.sin(half_yaw))
     cfg.events.reset_deformable = None
     cfg.events.virtual_grasp_contacts = EventTermCfg(func=filter_gripper_contacts, mode="prestartup")
+    print("[DEBUG] virtual_grasp_contacts params:",
+          cfg.events.virtual_grasp_contacts.params, flush=True)
     # Repeat the same starting arm pose for comparable vibration observations.
     cfg.events.reset_robot_arm_joints.params["position_range"] = (1.0, 1.0)
     cfg.curriculum.gravity = None
@@ -225,7 +227,11 @@ def main():
             # Success markers are created visible independently of debug_vis.
             # With no success asset they otherwise spawn a table-sized cube at
             # the world origin, hiding the robot and cloth.
-            base.command_manager.get_term("deformable_pose").success_visualizer.set_visibility(False)
+            term = base.command_manager.get_term("deformable_pose")
+            visualizer = term.success_visualizer
+
+            if visualizer is not None:
+                visualizer.set_visibility(False)
             scene = base.scene
             cloth, ee = scene["deformable"], scene["ee_frame"]
             towel = TowelVisual(cloth, args.cloth_thickness,
