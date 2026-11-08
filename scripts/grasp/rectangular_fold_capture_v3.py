@@ -52,7 +52,7 @@ def filter_gripper_contacts_event(env, env_ids):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--capture_limit", type=int, default=15,
+    parser.add_argument("--capture_limit", type=int, default=24,
                         help="Maximum synchronized camera pairs per run")
     parser.add_argument("--capture_stride", type=int, default=75,
                         help="Minimum physics steps between captures")
@@ -181,9 +181,9 @@ def main():
     saved_count = 0
     last_periodic_capture_step = -10**9
     category_counts = {"flat": 0, "lifted": 0, "partial": 0, "folded": 0}
-    # Reserve up to six shots for approach/descend/grasp on the first two corners.
-    # The remaining slots are for periodic captures across the folding phases.
-    event_limit = min(6, args.capture_limit)
+    # Reserve up to 14 event shots: seven per Pick & Place for two corners.
+    # Remaining slots retain periodic samples across the folding phases.
+    event_limit = min(14, args.capture_limit)
     periodic_limit = args.capture_limit - event_limit
     event_saved = 0
     periodic_saved = 0
@@ -521,6 +521,10 @@ def main():
                     node_goal = torch.lerp(start_node, destination_now, alpha)
                     node_goal[2] += arc_height * math.sin(math.pi * t) + max(0.003, args.cloth_thickness + 0.001) * alpha
                     move(node_goal - offset, 60 if correction else 120)
+                    if not correction and segment == 2:
+                        save_camera_sample("lift", source, destination)
+                    if not correction and segment == 5:
+                        save_camera_sample("transfer", source, destination)
                 phase = f"{number}_lower"
                 for _ in range(3):
                     goal = corners()[destination].clone() - offset
@@ -529,11 +533,15 @@ def main():
                 phase = f"{number}_release"
                 set_gripper(closed=False)
                 picker.release()
+                if not correction:
+                    save_camera_sample("release", source, destination)
                 phase = f"{number}_retreat"
                 retreat = anchor().clone()
                 retreat[2] += 0.10
                 move(retreat, 180)
                 hold(math.ceil(args.settle_seconds / base.physics_dt))
+                if not correction:
+                    save_camera_sample("settled", source, destination)
                 print(f"[fold] after placement {number}: distances={pair_distances(corners(), pairs)}", flush=True)
 
             with torch.inference_mode():
