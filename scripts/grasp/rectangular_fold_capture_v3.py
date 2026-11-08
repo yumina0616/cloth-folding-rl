@@ -46,7 +46,9 @@ from cloth_corner_tracker import detect_corner_vertex_indices, get_corner_world_
 from rectangular_fold_geometry import rectangular_pairs, pair_distances
 from successful_video import gate_video_recorders
 from towel_visual import TowelVisual
-
+def filter_gripper_contacts_event(env, env_ids=None):
+    """Isaac Lab event callback for virtual grasp collision filtering."""
+    return filter_gripper_contacts(env)
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -147,7 +149,7 @@ def main():
     half_yaw = math.radians(args.cloth_yaw_deg) / 2
     cfg.scene.deformable.init_state.rot = (math.cos(half_yaw), 0.0, 0.0, math.sin(half_yaw))
     cfg.events.reset_deformable = None
-    cfg.events.virtual_grasp_contacts = EventTermCfg(func=filter_gripper_contacts, mode="prestartup")
+    cfg.events.virtual_grasp_contacts = EventTermCfg(func=filter_gripper_contacts_event, mode="prestartup")
     print("[DEBUG] virtual_grasp_contacts params:",
           cfg.events.virtual_grasp_contacts.params, flush=True)
     # Repeat the same starting arm pose for comparable vibration observations.
