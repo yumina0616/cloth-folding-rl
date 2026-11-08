@@ -179,14 +179,19 @@ def main():
     capture_root = args.capture_dir.resolve() / run_dir.name
     capture_root.mkdir(parents=True, exist_ok=True)
     saved_count = 0
-    last_capture_step = -10**9
+    last_periodic_capture_step = -10**9
     category_counts = {"flat": 0, "lifted": 0, "partial": 0, "folded": 0}
-    # Distribute frames across distinct phases within each episode.
+    # Reserve up to six shots for approach/descend/grasp on the first two corners.
+    # The remaining slots are for periodic captures across the folding phases.
+    event_limit = min(6, args.capture_limit)
+    periodic_limit = args.capture_limit - event_limit
+    event_saved = 0
+    periodic_saved = 0
     fractions = (0.27, 0.27, 0.26)
-    quotas = {"flat": round(args.capture_limit*fractions[0]),
-              "lifted": round(args.capture_limit*fractions[1]),
-              "partial": round(args.capture_limit*fractions[2])}
-    quotas["folded"] = args.capture_limit-sum(quotas.values())
+    quotas = {"flat": round(periodic_limit * fractions[0]),
+              "lifted": round(periodic_limit * fractions[1]),
+              "partial": round(periodic_limit * fractions[2])}
+    quotas["folded"] = periodic_limit - sum(quotas.values())
 
 
     (run_dir / "config.json").write_text(json.dumps(vars(args), default=str, indent=2), encoding="utf-8")
@@ -304,20 +309,35 @@ def main():
                     return "lifted"
                 return "flat"
 
-            def save_camera_sample():
-                nonlocal saved_count, last_capture_step
+            def save_camera_sample(capture_event=None, target_corner_index=None,
+                                   destination_corner_index=None):
+                nonlocal saved_count, last_periodic_capture_step, event_saved, periodic_saved
                 if corner_indices is None or saved_count >= args.capture_limit:
-                    return
+                    return False
                 category = _phase_category(phase)
-                if category_counts[category] >= quotas[category]:
-                    return
-                if step_index - last_capture_step < args.capture_stride:
-                    return
+                is_event = capture_event is not None
+                if is_event:
+                    # Event shots bypass time spacing and per-phase quotas.
+                    if event_saved >= event_limit:
+                        return False
+                    if target_corner_index is None:
+                        raise ValueError("Event capture requires target_corner_index")
+                else:
+                    if periodic_saved >= periodic_limit:
+                        return False
+                    if category_counts[category] >= quotas[category]:
+                        return False
+                    if step_index - last_periodic_capture_step < args.capture_stride:
+                        return False
                 xyz = _numpy(corners()).reshape(4, 3)
                 basename = f"frame_{saved_count:04d}"
                 record = {
                     "frame_id": basename, "physics_step": step_index,
                     "phase": phase, "category": category,
+                    "capture_kind": "event" if is_event else "periodic",
+                    "capture_event": capture_event,
+                    "target_corner_index": int(target_corner_index) if target_corner_index is not None else None,
+                    "destination_corner_index": int(destination_corner_index) if destination_corner_index is not None else None,
                     "cloth_start_xy_yaw": [args.cloth_x, args.cloth_y, args.cloth_yaw_deg],
                     "corner_vertex_ids": corner_indices.tolist(),
                     "corners_world_xyz_m": xyz.tolist(),
@@ -370,9 +390,16 @@ def main():
                 (capture_root / f"{basename}.json").write_text(
                     json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
                 saved_count += 1
-                category_counts[category] += 1
-                last_capture_step = step_index
-                print(f"[capture] {saved_count}/{args.capture_limit} category={category} phase={phase}", flush=True)
+                if is_event:
+                    event_saved += 1
+                else:
+                    periodic_saved += 1
+                    category_counts[category] += 1
+                    last_periodic_capture_step = step_index
+                print(f"[capture] {saved_count}/{args.capture_limit} "
+                      f"kind={'event' if is_event else 'periodic'} event={capture_event} "
+                      f"target={target_corner_index} phase={phase}", flush=True)
+                return True
 
             def step():
                 nonlocal step_index
@@ -454,15 +481,21 @@ def main():
                 safe[2] = max(float(safe[2]), float(above[2]))
                 move(safe, 120)
                 move(above, goal_quat_w=action.new_tensor((1.0, 0.0, 0.0, 0.0)))
+                if not correction:
+                    save_camera_sample("approach", source, destination)
                 phase = f"{number}_descend"
                 touch = corners()[source].clone()
                 touch[2] += 0.015
                 move(touch, 180)
+                if not correction:
+                    save_camera_sample("descend", source, destination)
                 phase = f"{number}_grasp"
                 set_gripper(closed=True)
                 current = corners()[source].clone()
                 if not picker.grasp(current, vertex_id=vertex):
                     raise RuntimeError(f"Corner {source} is outside grasp radius")
+                if not correction:
+                    save_camera_sample("grasp", source, destination)
                 # Sweep around the fold line. A high horizontal translation
                 # pulled the far edge away and exceeded the robot workspace.
                 offset = picker.target_position_w - anchor()
@@ -594,8 +627,13 @@ def main():
             finally:
                 result["capture_count"] = saved_count
                 result["capture_by_category"] = category_counts
+                result["capture_event_count"] = event_saved
+                result["capture_periodic_count"] = periodic_saved
                 (capture_root / "capture_summary.json").write_text(
                     json.dumps({"saved_pairs": saved_count, "phase_counts": category_counts,
+                                "saved_event_pairs": event_saved,
+                                "saved_periodic_pairs": periodic_saved,
+                                "reserved_event_pairs": event_limit,
                                 "expected_pairs": args.capture_limit}, indent=2), encoding="utf-8")
                 (run_dir / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
                 if rows:
