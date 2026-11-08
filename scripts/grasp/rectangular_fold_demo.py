@@ -1,3 +1,4 @@
+﻿
 """Sequential rectangular cloth fold with one virtual gripper.
 
 Run with the Isaac Lab launcher; see README_rectangular_fold.md.
@@ -28,7 +29,12 @@ from isaaclab.visualizers import VisualizerCfg
 from isaaclab.managers import EventTermCfg
 from isaaclab.utils.math import subtract_frame_transforms
 from isaaclab_tasks.utils import resolve_task_config, setup_preset_cli
-import isaaclab_tasks  # noqa: F401
+import isaaclab_tasks  
+
+project_root = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(project_root))
+
+from scripts.learning.demonstration_recorder import DemonstrationRecorder
 
 from a_single_point_picker import as_tensor
 from virtual_attachment_picker import create_picker, filter_gripper_contacts
@@ -121,6 +127,13 @@ def main():
 
     run_dir = args.video_dir.resolve() / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     run_dir.mkdir(parents=True, exist_ok=False)
+
+    demo_dir = project_root / "data" / "demonstrations" / run_dir.name
+
+    
+    recorder = None
+
+
     (run_dir / "config.json").write_text(json.dumps(vars(args), default=str, indent=2), encoding="utf-8")
     result = {"success": False, "status": "running", "threshold_m": args.success_distance}
     rows = []
@@ -311,17 +324,39 @@ def main():
                 hold(math.ceil(args.settle_seconds / base.physics_dt))
                 print(f"[fold] after placement {number}: distances={pair_distances(corners(), pairs)}", flush=True)
 
-
             with torch.inference_mode():
                 hold(120)
                 corner_indices = detect_corner_vertex_indices(as_tensor(cloth.data.nodal_pos_w)[0])
                 pairs = rectangular_pairs(corners(), as_tensor(robot.data.root_pos_w)[0, :2])
+                recorder = DemonstrationRecorder(
+                demo_dir=demo_dir,
+                pairs=pairs,
+                success_threshold=args.success_distance,
+            )
                 result["corner_vertex_ids"] = corner_indices.tolist()
                 result["pairs"] = pairs
                 result["initial_distances_m"] = pair_distances(corners(), pairs)
                 print(f"[fold] tracked vertices={corner_indices.tolist()}, pairs={pairs}", flush=True)
+
+                # Record each high-level Pick & Place without changing the fold controller.
                 for number, (source, destination) in enumerate(pairs, 1):
+                    low_level_start = len(rows)
+                    before_corners = corners().clone()
+                    pick_xy = before_corners[source, :2].cpu().tolist()
+                    place_xy = before_corners[destination, :2].cpu().tolist()
+
                     place_corner(source, destination, number)
+                    low_level_end = len(rows)
+                    after_corners = corners().clone()
+                    reward, success = recorder.record_action(
+                        before_corners=before_corners,
+                        after_corners=after_corners,
+                        pick_xy=pick_xy,
+                        place_xy=place_xy,
+                        low_level_start=low_level_start,
+                        low_level_end=low_level_end,
+                    )
+
                 result["correction_count"] = 0
                 # Re-read the released cloth and correct only the worst pair.
                 # Tiny corrections use a low arc rather than lifting 12cm again.
@@ -331,18 +366,54 @@ def main():
                     distances = pair_distances(corners(), pairs)
                     if all(d <= args.success_distance for d in distances):
                         break
+
                     worst = max(range(len(pairs)), key=distances.__getitem__)
                     print(f"[fold] correction {correction + 1}: pair={worst}, error={distances[worst]:.4f} m", flush=True)
-                    place_corner(*pairs[worst], number=f"correction_{correction + 1}", correction=True)
+                    source, destination = pairs[worst]
+                    low_level_start = len(rows)
+                    before_corners = corners().clone()
+                    pick_xy = before_corners[source, :2].cpu().tolist()
+                    place_xy = before_corners[destination, :2].cpu().tolist()
+
+                    place_corner(
+                        source, destination,
+                        number=f"correction_{correction + 1}", correction=True,
+                    )
+                    low_level_end = len(rows)
+                    after_corners = corners().clone()
+                    reward, success = recorder.record_action(
+                        before_corners=before_corners,
+                        after_corners=after_corners,
+                        pick_xy=pick_xy,
+                        place_xy=place_xy,
+                        low_level_start=low_level_start,
+                        low_level_end=low_level_end,
+                    )
                     result["correction_count"] += 1
+
                 phase = "evaluation"
                 hold(math.ceil(args.settle_seconds / base.physics_dt))
-                distances = pair_distances(corners(), pairs)
-                result.update(status="completed", final_distances_m=distances,
-                              final_corner_positions_w=corners().tolist(),
-                              final_rms_speed_m_s=float(torch.sqrt((as_tensor(cloth.data.nodal_vel_w)[0] ** 2).sum(-1).mean())),
-                              success=all(math.isfinite(d) and d <= args.success_distance for d in distances))
+                final_corners = corners().clone()
+                distances = pair_distances(final_corners, pairs)
+                result.update(
+                    status="completed",
+                    final_distances_m=distances,
+                    final_corner_positions_w=final_corners.tolist(),
+                    final_rms_speed_m_s=float(
+                        torch.sqrt((as_tensor(cloth.data.nodal_vel_w)[0] ** 2).sum(-1).mean())
+                    ),
+                    success=all(math.isfinite(d) and d <= args.success_distance for d in distances),
+                )
+                # Final settle happens after the last Pick & Place: make the final
+                # transition's next observation, reward and terminal status agree.
+                if recorder is not None and recorder.logger.records:
+                    recorder.finalize(
+                        final_corners=final_corners,
+                        success=result["success"],
+                    )
                 print(f"[fold] success={result['success']}, final distances={distances}", flush=True)
+
+
         except BaseException as exc:
             result.update(status="error", error=f"{type(exc).__name__}: {exc}", phase=phase)
             raise
@@ -362,15 +433,14 @@ def main():
                         for t, label, _, _, points, _, grasping in rows:
                             distances = pair_distances(torch.from_numpy(points), pairs)
                             writer.writerow([t, label, grasping, *distances])
-                    if result["success"]:
-                        np.savez_compressed(run_dir / "demonstration.npz",
-                                            time_s=np.array([r[0] for r in rows]),
-                                            phase=np.array([r[1] for r in rows]),
-                                            action=np.stack([r[2] for r in rows]),
-                                            joint_pos=np.stack([r[3] for r in rows]),
-                                            corners_w=np.stack([r[4] for r in rows]),
-                                            tcp_w=np.stack([r[5] for r in rows]),
-                                            grasping=np.array([r[6] for r in rows]))
+                    if result["success"] and recorder is not None:
+                        recorder.save_if_success(
+                            success=result["success"],
+                            low_level_data=rows,
+                            episode_id=run_dir.name,
+                        )
+                        print(f"[logger] Saved demonstration to {demo_dir}", flush=True)
+
             if video_dir is not None and result["success"]:
                 clips = list(video_dir.glob("*.mp4"))
                 if not clips or not all(clip.stat().st_size > 0 for clip in clips):
