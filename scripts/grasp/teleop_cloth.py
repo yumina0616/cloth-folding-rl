@@ -66,7 +66,7 @@ def configure(args):
     else:
         cfg.scene.robot.spawn.make_uninstanceable = True
         cfg.scene.robot.spawn.physics_material = sim_utils.RigidBodyMaterialCfg(
-            static_friction=2.0, dynamic_friction=1.5, restitution=0., friction_combine_mode="max")
+            static_friction=3.0, dynamic_friction=2.0, restitution=0., friction_combine_mode="max")
         hand = cfg.scene.robot.actuators["panda_hand"]
         hand.joint_effort_limit, hand.stiffness, hand.damping = 70., 500., 100.
     cfg.events.reset_robot_arm_joints.params["position_range"] = (1.0, 1.0)
