@@ -34,7 +34,7 @@ import isaaclab_tasks  # noqa: F401
 
 from a_single_point_picker import as_tensor
 from virtual_attachment_picker import filter_gripper_contacts
-from physical_picker import create_picker, physical_grasp_xy
+from physical_picker import create_picker, pinch_vertex
 from finger_pad_probe import probe_finger_pads
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "corner_tracking"))
 from cloth_corner_tracker import detect_corner_vertex_indices, get_corner_world_positions
@@ -226,6 +226,7 @@ def main():
     corner_indices = None
     pairs = None
     initial_center_xy = None  # centre of the four corners while the cloth is still flat
+    pinch_vertices = None     # per corner: the cloth vertex to pinch (physical grasp), chosen on the flat cloth
     video_dir = None
     if args.video:
         from isaaclab.envs.utils.video_recorder_cfg import VideoRecorderCfg
@@ -381,15 +382,12 @@ def main():
             physical = args.grasp_mode == "physical"
 
             def grasp_target(source):
-                """Where the TCP goes down: the corner itself (virtual) or the 008 point near it (physical)."""
-                corner = corners()[source].clone()
+                """Where the TCP goes down: the corner itself (virtual) or the cloth point just inside it (physical)."""
                 if physical:
-                    # Inward = toward the cloth body as it lay flat. The current corner mean would collapse
-                    # onto the fold edge after folding, so its sign (and the inward direction) is unstable.
-                    corner[:2] = physical_grasp_xy(corner[:2], initial_center_xy, args.open_width,
-                                                   pad_half=args.pad_half, edge_margin=args.edge_margin,
-                                                   jaw_axis=args.jaw_axis)
-                return corner
+                    # A fixed piece of cloth (chosen on the flat cloth), read where it is now: still just inside
+                    # the corner when the cloth is folded, flipped or rotated, and it is on the same layer.
+                    return as_tensor(cloth.data.nodal_pos_w)[0, pinch_vertices[source]].clone()
+                return corners()[source].clone()
 
             def grasp_check(source, number):
                 """Lift a little and hold: the corner must follow and stay close to the TCP."""
@@ -438,9 +436,13 @@ def main():
                     # Virtual: stop 1.5 cm above the corner. Physical: fingertips on the cloth (blocked by the table)
                     touch[2] += -args.press_depth if physical else 0.015
                     move(touch, 180, strict=not physical)
+                    if physical:
+                        # Physical descent is not strict: record where the hand really stopped vs the target
+                        record["descend_error_mm"] = [round(float(v) * 1000, 1) for v in anchor() - touch]
                     phase = f"{number}_grasp"
                     record["open_gap_m"] = float(as_tensor(robot.data.joint_pos)[0, finger_ids].sum())
                     set_gripper(closed=True)
+                    record["gap_closed_mm"] = round(float(as_tensor(robot.data.joint_pos)[0, finger_ids].sum()) * 1000, 1)
                     current = corners()[source].clone()
                     if not picker.grasp(current, vertex_id=vertex):
                         if not physical:
@@ -449,6 +451,7 @@ def main():
                     elif not physical:
                         record.update(ok=True)
                     else:
+                        record["offset_at_close_mm"] = [round(float(v) * 1000, 1) for v in picker.corner_offset()]
                         record.update(grasp_check(source, number))
                         if record["ok"]:
                             # Measure slip from the settled grip, not from the moment of closing
@@ -534,6 +537,18 @@ def main():
                 pairs = rectangular_pairs(corners(), as_tensor(robot.data.root_pos_w)[0, :2])
                 initial_center_xy = corners()[:, :2].mean(dim=0).clone()
                 result["initial_center_xy"] = initial_center_xy.tolist()
+                if physical:
+                    flat_nodes = as_tensor(cloth.data.nodal_pos_w)[0].clone()
+                    pinch_vertices = [pinch_vertex(flat_nodes[:, :2], int(v), initial_center_xy, args.open_width,
+                                                   pad_half=args.pad_half, edge_margin=args.edge_margin,
+                                                   jaw_axis=args.jaw_axis) for v in corner_indices.tolist()]
+                    result["pinch_vertices"] = pinch_vertices
+                    # Achieved offset from each corner (mesh spacing limits how exact it is)
+                    result["pinch_offsets_mm"] = [
+                        [round(float(d) * 1000, 1) for d in flat_nodes[p, :2] - flat_nodes[c, :2]]
+                        for p, c in zip(pinch_vertices, corner_indices.tolist())]
+                    print(f"[fold] pinch vertices={pinch_vertices}, offsets from corner mm={result['pinch_offsets_mm']}",
+                          flush=True)
                 result["corner_vertex_ids"] = corner_indices.tolist()
                 result["pairs"] = pairs
                 result["initial_distances_m"] = pair_distances(corners(), pairs)

@@ -13,6 +13,7 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 PhysicalPicker = MODULE.PhysicalPicker
 physical_grasp_xy = MODULE.physical_grasp_xy
+pinch_vertex = MODULE.pinch_vertex
 create_picker = MODULE.create_picker
 
 
@@ -42,6 +43,41 @@ class GraspPointTest(unittest.TestCase):
     def test_rejects_bad_width(self):
         with self.assertRaises(ValueError):
             physical_grasp_xy(torch.tensor([0.0, 0.0]), torch.tensor([0.15, 0.15]), 0.0)
+
+
+class PinchVertexTest(unittest.TestCase):
+    def setUp(self):
+        # A flat 0.30 m cloth with 5 mm spacing; vertex 0 is the corner at the origin
+        axis = torch.arange(0, 61) * 0.005
+        gx, gy = torch.meshgrid(axis, axis, indexing="ij")
+        self.flat = torch.stack([gx.flatten(), gy.flatten(), torch.full_like(gx.flatten(), 0.002)], dim=1)
+        self.center = torch.tensor([0.15, 0.15])
+        self.vertex = pinch_vertex(self.flat[:, :2], 0, self.center, 0.04, jaw_axis="x")
+
+    def test_flat_state_matches_the_grasp_point(self):
+        # jaw along x: 35 mm along x and 15 mm along y inside the corner
+        self.assertTrue(torch.allclose(self.flat[self.vertex, :2], torch.tensor([0.035, 0.015]), atol=1e-6))
+
+    def test_stays_just_inside_the_corner_after_the_cloth_is_flipped(self):
+        # Fold the whole cloth over about x = 0.15: the corner moves from x = 0 to x = 0.30
+        flipped = self.flat.clone()
+        flipped[:, 0] = 0.30 - flipped[:, 0]
+        flipped[:, 2] = 0.008
+        corner, pinch = flipped[0, :2], flipped[self.vertex, :2]
+        # The pinch point is 35 mm toward the cloth (-x), 15 mm toward +y; a recomputed
+        # "toward the original centre" direction would have pointed outside the cloth (+x)
+        self.assertTrue(torch.allclose(pinch - corner, torch.tensor([-0.035, 0.015]), atol=1e-6))
+
+    def test_stays_just_inside_the_corner_after_the_cloth_is_rotated(self):
+        # Rotate the cloth 90 degrees about its centre: the pinch vertex must still be 38 mm from the corner
+        offset = self.flat[:, :2] - self.center
+        rotated = torch.stack([-offset[:, 1], offset[:, 0]], dim=1) + self.center
+        gap = torch.linalg.vector_norm(rotated[self.vertex] - rotated[0])
+        self.assertAlmostEqual(float(gap), (0.035 ** 2 + 0.015 ** 2) ** 0.5, places=5)
+
+    def test_rejects_bad_vertex(self):
+        with self.assertRaises(ValueError):
+            pinch_vertex(self.flat[:, :2], 10 ** 6, self.center, 0.04)
 
 
 class PhysicalPickerTest(unittest.TestCase):

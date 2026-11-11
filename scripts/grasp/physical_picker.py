@@ -37,6 +37,25 @@ def physical_grasp_xy(corner_xy, center_xy, open_width, *, pad_half=0.01, edge_m
     return corner_xy + toward_center * corner_xy.new_tensor(room)
 
 
+def pinch_vertex(flat_nodes_xy, corner_vertex, center_xy, open_width, *, pad_half=0.01, edge_margin=0.005,
+                 jaw_axis="y"):
+    """Mesh vertex to pinch for a corner, chosen once on the flat cloth.
+
+    The grasp point is a piece of cloth: the vertex nearest to "the corner moved inward by the pad room"
+    in the flat (material) state. Reading that vertex's current position later gives the point just
+    inside the corner however the cloth has since been folded, flipped or rotated, and the inward
+    direction is never recomputed from the deformed shape.
+    """
+    nodes = torch.as_tensor(flat_nodes_xy)
+    if nodes.ndim != 2 or nodes.shape[1] != 2:
+        raise ValueError("flat_nodes_xy must have shape (N, 2)")
+    if not 0 <= int(corner_vertex) < nodes.shape[0]:
+        raise ValueError("corner_vertex is outside the cloth mesh")
+    wanted = physical_grasp_xy(nodes[int(corner_vertex)], center_xy, open_width, pad_half=pad_half,
+                               edge_margin=edge_margin, jaw_axis=jaw_axis)
+    return int(torch.argmin(((nodes - wanted) ** 2).sum(dim=1)))
+
+
 class PhysicalPicker:
     def __init__(self, cloth, anchor_position, *, env_id=0, grasp_radius=0.06):
         if not math.isfinite(grasp_radius) or grasp_radius <= 0:
