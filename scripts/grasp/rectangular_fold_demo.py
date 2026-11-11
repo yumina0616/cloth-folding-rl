@@ -98,9 +98,9 @@ def main():
                         help="Physical grasp: where the hand goes when placing. mirror = the point where the destination "
                              "corner would be pinched (the held corner lands on it); live = destination minus the "
                              "measured corner-to-hand offset (old behaviour, kept for comparison)")
-    parser.add_argument("--grasp_yaw_deg", type=float, default=90.0,
+    parser.add_argument("--grasp_yaw_deg", type=float, default=0.0,
                         help="Physical grasp only: hand rotation about world z (multiple of 90). "
-                             "0 = jaw closes along world y, 90 = along world x (the fold direction)")
+                             "0 (default, original) = jaw closes along world y, 90 = along world x (the fold direction)")
     # Transport monitoring
     parser.add_argument("--slip_drift", type=float, default=0.02, help="Corner-to-TCP change counted as slip [m]")
     parser.add_argument("--drop_height", type=float, default=0.01, help="Corner below this height above the table while carried = dropped [m]")
