@@ -33,25 +33,14 @@ sys.stdout.reconfigure(errors="replace")
 REPO = Path(__file__).resolve().parents[2]
 FOLD_SCRIPT = Path(__file__).resolve().parent / "rectangular_fold_demo.py"
 
-# Unified cloth (team table, 2026-11) and the physical grasp settings from 008. Same for every run.
-FIXED = {
-    "grasp_mode": "physical",
-    "cloth_size": 0.30,
-    "cloth_thickness": 0.003,
-    "cloth_density": 180.0,
-    "youngs_modulus": 1e6,
-    "poissons_ratio": 0.25,
-    "damping": 0.25,
-    "cloth_friction": 0.5,    # between table (0.3) and finger (1.5) so both combine modes act as intended
-    "finger_friction": 1.5,
-    "table_friction": 0.3,
-    "table_length": 1.5,
-    "table_width": 0.9,
-    "cloth_x": 0.50,
-    "cloth_y": -0.05,
-    "open_width": 0.04,
-    "press_depth": 0.0,
-}
+# Unified cloth (team table, 2026-11) and the physical grasp settings from 008, read from
+# configs/cloth_unified.json (the same file rectangular_fold_demo.py uses). Same for every run.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from run_config import DEFAULT_CONFIG, load_config  # noqa: E402
+
+# bend stiffness and mesh are what this grid varies, so they are not fixed here
+FIXED = {"grasp_mode": "physical",
+         **{k: v for k, v in load_config(DEFAULT_CONFIG).items() if k not in ("bend_stiffness", "mesh_refinement")}}
 
 # Bend stiffness: 10 values from 185 to 10000, each about 1.56x the previous one
 BEND_MIN, BEND_MAX, BEND_COUNT = 185.0, 10000.0, 10
@@ -102,7 +91,24 @@ def load_done(csv_path: Path) -> dict[str, dict]:
     if not csv_path.exists():
         return {}
     with csv_path.open(encoding="utf-8", newline="") as f:
-        return {row["run_id"]: row for row in csv.DictReader(f)}
+        rows = list(csv.DictReader(f))
+    # run_id does not include the fixed settings: ignore rows made with other fixed values
+    # (e.g. before configs/cloth_unified.json changed), so they are run again, not reused
+    same = [row for row in rows if all(same_value(row.get(key), FIXED[key]) for key in FIXED)]
+    if len(same) < len(rows):
+        print(f"[sweep] {len(rows) - len(same)} rows in {csv_path} used other fixed settings and are ignored", flush=True)
+    return {row["run_id"]: row for row in same}
+
+
+def same_value(text, value) -> bool:
+    if text is None:
+        return False
+    if isinstance(value, str):
+        return text == value
+    try:
+        return abs(float(text) - float(value)) <= 1e-9 * max(1.0, abs(float(value)))
+    except ValueError:
+        return False
 
 
 def command_for(params: dict, stage: str, trial_dir: Path) -> list[str]:
