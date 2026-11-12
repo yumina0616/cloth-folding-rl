@@ -89,6 +89,11 @@ def main():
     # Grasp check after closing: lift a little, the corner must follow and stay close to the TCP
     parser.add_argument("--check_lift", type=float, default=0.06, help="Lift used to check the grasp [m] (same height as #14)")
     parser.add_argument("--check_hold_s", type=float, default=1.0, help="Hold time of the grasp check [s]")
+    parser.add_argument("--grasp_settle_s", type=float, default=0.5,
+                        help="Physical grasp: extra wait after the gripper has closed, before lifting [s] "
+                             "(0 = old behaviour, lift right after the 1 s close)")
+    parser.add_argument("--check_lift_s", type=float, default=2.0,
+                        help="Physical grasp: duration of the grasp-check lift [s] (0.5 = old behaviour, 60 steps)")
     parser.add_argument("--check_min_rise", type=float, default=0.015, help="Corner must rise at least this much [m]")
     parser.add_argument("--quality_max", type=float, default=0.0,
                         help="Corner must stay within this distance of the TCP [m] (#14). 0 = off: "
@@ -132,6 +137,10 @@ def main():
         parser.error("Physical grasp assumes an unrotated cloth (the jaw closes along world y)")
     if not math.isfinite(args.grasp_yaw_deg) or args.grasp_yaw_deg % 90 != 0:
         parser.error("grasp_yaw_deg must be a multiple of 90")
+    if not (math.isfinite(args.grasp_settle_s) and args.grasp_settle_s >= 0):
+        parser.error("grasp_settle_s must be >= 0")
+    if not (math.isfinite(args.check_lift_s) and args.check_lift_s > 0):
+        parser.error("check_lift_s must be > 0")
     args.hand_yaw_deg = args.grasp_yaw_deg if args.grasp_mode == "physical" else 0.0
     args.jaw_axis = "y" if args.hand_yaw_deg % 180 == 0 else "x"
     rng = random.Random(args.seed)
@@ -217,6 +226,7 @@ def main():
                "youngs_modulus": material.youngs_modulus, "bend_stiffness": material.surface_bend_stiffness,
                "cloth_friction": material.dynamic_friction, "stack_check_lift": args.stack_check_lift,
                "hand_yaw_deg": args.hand_yaw_deg, "jaw_axis": args.jaw_axis, "place_mode": args.place_mode,
+               "grasp_settle_s": args.grasp_settle_s, "check_lift_s": args.check_lift_s,
                "open_command": cfg.actions.gripper_action.open_command_expr}
     result = {"success": False, "status": "running", "threshold_m": args.success_distance, "applied": applied,
               "grasp_mode": args.grasp_mode, "stop_after": args.stop_after,
@@ -395,10 +405,13 @@ def main():
                 """Lift a little and hold: the corner must follow and stay close to the TCP."""
                 nonlocal phase
                 phase = f"{number}_grasp_check"
+                # Let the squeeze settle before lifting (the close command itself already took 1 s)
+                hold(math.ceil(args.grasp_settle_s / base.physics_dt))
                 start_z = float(corners()[source][2])
                 lift = anchor().clone()
                 lift[2] += args.check_lift
-                move(lift, 60, strict=False)
+                # Slow lift: smoothstep over check_lift_s, peak speed = 1.5 * check_lift / check_lift_s
+                move(lift, max(1, math.ceil(args.check_lift_s / base.physics_dt)), strict=False)
                 hold(math.ceil(args.check_hold_s / base.physics_dt))
                 corner = corners()[source]
                 rise = float(corner[2]) - start_z
