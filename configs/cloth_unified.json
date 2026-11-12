@@ -1,0 +1,22 @@
+{
+  "_source": "팀 결정 '현재 파라미터 차이' 표의 고정 열 (2026-11): 30x30 cm, 3 mm, 밀도 180, Young 100만, 감쇠 0.25/0.25, 메시 refinement 32, 자기 충돌 켬(데모 코드에서 항상 켬)",
+  "_bend_note": "굽힘 강성은 185~10000 안에서 009 그리드로 찾는 중이라 여기에 없음 (데모 기본 약 185). 메시 32가 안 되면 수정 후 팀에 알림",
+  "_poisson_note": "포아송비는 표에서 비어 있음. 두 기존 설정 모두 0.25(기본)라 0.25 유지",
+  "_friction_note": "팀 결정: 마찰은 현실성보다 가장 잘 되는 값. 천 10은 #19 가상 접기와 지금까지의 물리 파지 실행이 쓴 과제 기본값(운동 10). 가장 잘 되는 값인지는 측정 안 함. 손가락(max)과 결합하면 손가락-천 = max(10, 1.5) = 10이라 손가락 값은 사실상 안 쓰임. 결합 방식이 천에도 적용되는지는 확인 안 됨. --cloth_friction은 정지 = 운동 + 0.5",
+  "cloth_size": 0.30,
+  "cloth_thickness": 0.003,
+  "cloth_density": 180.0,
+  "youngs_modulus": 1000000.0,
+  "poissons_ratio": 0.25,
+  "damping": 0.25,
+  "mesh_refinement": 32,
+  "cloth_friction": 10.0,
+  "finger_friction": 1.5,
+  "table_friction": 0.3,
+  "table_length": 1.5,
+  "table_width": 0.9,
+  "cloth_x": 0.50,
+  "cloth_y": -0.05,
+  "open_width": 0.04,
+  "press_depth": 0.0
+}

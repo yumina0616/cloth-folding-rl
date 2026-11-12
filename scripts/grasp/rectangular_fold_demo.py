@@ -36,6 +36,7 @@ from a_single_point_picker import as_tensor
 from virtual_attachment_picker import filter_gripper_contacts
 from physical_picker import create_picker, pinch_vertex
 from finger_pad_probe import probe_finger_pads
+from run_config import DEFAULT_CONFIG, apply_config_defaults
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "corner_tracking"))
 from cloth_corner_tracker import detect_corner_vertex_indices, get_corner_world_positions
 from rectangular_fold_geometry import rectangular_pairs, pair_distances
@@ -119,6 +120,10 @@ def main():
     parser.add_argument("--save_all_videos", action="store_true",
                         help="Write the MP4 for every run, failed ones included (default: successful runs only)")
     parser.add_argument("--video_dir", type=Path, default=Path(__file__).resolve().parents[2] / "videos" / "rectangular_fold")
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG),
+                        help="JSON of cloth/table/finger settings used as defaults (009 unified cloth); "
+                             "command-line options still override it. 'none' = the script defaults only")
+    apply_config_defaults(parser, sys.argv[1:])
     add_launcher_args(parser)
     if "--no_gui" not in sys.argv:
         parser.set_defaults(visualizer=["kit"])
