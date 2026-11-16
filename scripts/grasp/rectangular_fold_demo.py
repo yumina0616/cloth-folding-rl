@@ -300,7 +300,10 @@ def main():
             # Success markers are created visible independently of debug_vis.
             # With no success asset they otherwise spawn a table-sized cube at
             # the world origin, hiding the robot and cloth.
-            base.command_manager.get_term("deformable_pose").success_visualizer.set_visibility(False)
+            # Isaac Lab v3.0.0 (release) does not create the marker at all, so it can be None.
+            success_marker = getattr(base.command_manager.get_term("deformable_pose"), "success_visualizer", None)
+            if success_marker is not None:
+                success_marker.set_visibility(False)
             scene = base.scene
             cloth, ee = scene["deformable"], scene["ee_frame"]
             towel = TowelVisual(cloth, args.cloth_thickness,
