@@ -77,15 +77,21 @@ def main():
     # Optional shared cloth/table settings (unset = keep the task defaults, as before)
     parser.add_argument("--poissons_ratio", type=float, default=None)
     parser.add_argument("--damping", type=float, default=None, help="Cloth elasticity and bend damping")
-    parser.add_argument("--cloth_friction", type=float, default=None, help="Cloth dynamic friction (static = dynamic + 0.5)")
-    parser.add_argument("--table_friction", type=float, default=None, help="Table dynamic friction, min combine (static = dynamic + 0.01)")
+    parser.add_argument("--cloth_friction", type=float, default=None, help="Cloth dynamic friction (None = task default)")
+    parser.add_argument("--cloth_static_friction", type=float, default=None,
+                        help="Cloth static friction (None = same as --cloth_friction)")
+    parser.add_argument("--table_friction", type=float, default=None,
+                        help="Table dynamic friction, min combine (None = task default material)")
+    parser.add_argument("--table_static_friction", type=float, default=None,
+                        help="Table static friction (None = same as --table_friction)")
     parser.add_argument("--pos_jitter", type=float, default=0.0, help="Max random shift of the cloth center in x and y [m] (per --seed)")
     # Physical grasp (only used with --grasp_mode physical; values from experiment 008)
     parser.add_argument("--open_width", type=float, default=0.04, help="Finger gap before closing [m]")
     parser.add_argument("--pad_half", type=float, default=0.01, help="Half width of a finger pad [m] (estimate)")
     parser.add_argument("--edge_margin", type=float, default=0.005, help="Clearance between a pad and the cloth edge [m]")
     parser.add_argument("--press_depth", type=float, default=0.0, help="TCP target below the cloth surface when closing [m]")
-    parser.add_argument("--finger_friction", type=float, default=1.5, help="Finger dynamic friction, max combine (static = dynamic + 0.5)")
+    parser.add_argument("--finger_friction", type=float, default=1.5, help="Finger dynamic friction, max combine")
+    parser.add_argument("--finger_static_friction", type=float, default=2.0, help="Finger static friction, max combine")
     parser.add_argument("--gripper_effort", type=float, default=70.0, help="Franka hand force limit [N] (real hand: 70 N continuous)")
     # Grasp check after closing: lift a little, the corner must follow and stay close to the TCP
     parser.add_argument("--check_lift", type=float, default=0.06, help="Lift used to check the grasp [m] (same height as #14)")
@@ -146,6 +152,18 @@ def main():
         parser.error("grasp_settle_s must be >= 0")
     if not (math.isfinite(args.check_lift_s) and args.check_lift_s > 0):
         parser.error("check_lift_s must be > 0")
+    # Static and dynamic friction are set separately; a missing static value equals the dynamic one
+    for name in ("cloth", "table", "finger"):
+        dynamic = getattr(args, f"{name}_friction")
+        static = getattr(args, f"{name}_static_friction")
+        if static is not None and dynamic is None:
+            parser.error(f"--{name}_static_friction needs --{name}_friction")
+        if dynamic is None:
+            continue
+        static = dynamic if static is None else static
+        if not (math.isfinite(dynamic) and math.isfinite(static) and 0 <= dynamic <= static):
+            parser.error(f"{name} friction must satisfy 0 <= dynamic ({dynamic}) <= static ({static})")
+        setattr(args, f"{name}_static_friction", static)
     args.hand_yaw_deg = args.grasp_yaw_deg if args.grasp_mode == "physical" else 0.0
     args.jaw_axis = "y" if args.hand_yaw_deg % 180 == 0 else "x"
     rng = random.Random(args.seed)
@@ -165,7 +183,7 @@ def main():
         material.elasticity_damping = args.damping
         material.bend_damping = args.damping
     if args.cloth_friction is not None:
-        material.static_friction = args.cloth_friction + 0.5
+        material.static_friction = args.cloth_static_friction
         material.dynamic_friction = args.cloth_friction
     cfg.scene.deformable.spawn.deformable_props.self_collision = True
     cfg.scene.deformable.spawn.size = (args.cloth_size, args.cloth_size)
@@ -184,7 +202,7 @@ def main():
     cfg.scene.table.spawn.visible = True
     if args.table_friction is not None:
         cfg.scene.table.spawn.physics_material = sim_utils.RigidBodyMaterialCfg(
-            static_friction=args.table_friction + 0.01, dynamic_friction=args.table_friction,
+            static_friction=args.table_static_friction, dynamic_friction=args.table_friction,
             restitution=0.0, friction_combine_mode="min")
     # The task table is a centered cuboid whose top sits at z = 0
     table_top_z = float(cfg.scene.table.init_state.pos[2]) + 1.05 / 2
@@ -199,7 +217,7 @@ def main():
         # Physical grasp: finger contact and friction hold the cloth (008 gripper settings).
         cfg.scene.robot.spawn.make_uninstanceable = True
         cfg.scene.robot.spawn.physics_material = sim_utils.RigidBodyMaterialCfg(
-            static_friction=args.finger_friction + 0.5, dynamic_friction=args.finger_friction,
+            static_friction=args.finger_static_friction, dynamic_friction=args.finger_friction,
             restitution=0.0, friction_combine_mode="max")
         cfg.scene.robot.actuators["panda_hand"].joint_effort_limit = args.gripper_effort
         cfg.scene.robot.actuators["panda_hand"].stiffness = 500.0
@@ -229,7 +247,11 @@ def main():
     (run_dir / "config.json").write_text(json.dumps(vars(args), default=str, indent=2), encoding="utf-8")
     applied = {"cloth_size": float(cfg.scene.deformable.spawn.size[0]), "density": material.density,
                "youngs_modulus": material.youngs_modulus, "bend_stiffness": material.surface_bend_stiffness,
-               "cloth_friction": material.dynamic_friction, "stack_check_lift": args.stack_check_lift,
+               "cloth_friction": material.dynamic_friction, "cloth_static_friction": material.static_friction,
+               "table_friction": args.table_friction, "table_static_friction": args.table_static_friction,
+               "finger_friction": args.finger_friction if args.grasp_mode == "physical" else None,
+               "finger_static_friction": args.finger_static_friction if args.grasp_mode == "physical" else None,
+               "stack_check_lift": args.stack_check_lift,
                "hand_yaw_deg": args.hand_yaw_deg, "jaw_axis": args.jaw_axis, "place_mode": args.place_mode,
                "grasp_settle_s": args.grasp_settle_s, "check_lift_s": args.check_lift_s,
                "open_command": cfg.actions.gripper_action.open_command_expr}

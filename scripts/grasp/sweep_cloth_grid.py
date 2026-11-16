@@ -94,7 +94,11 @@ def load_done(csv_path: Path) -> dict[str, dict]:
         rows = list(csv.DictReader(f))
     # run_id does not include the fixed settings: ignore rows made with other fixed values
     # (e.g. before configs/cloth_unified.json changed), so they are run again, not reused
-    same = [row for row in rows if all(same_value(row.get(key), FIXED[key]) for key in FIXED)]
+    # Static friction columns are newer than some CSVs: those rows used the old implicit rule
+    # (static = dynamic + 0.5 / + 0.01), which gives the same values as the config, so a missing column matches.
+    same = [row for row in rows
+            if all((key.endswith("_static_friction") and key not in row) or same_value(row.get(key), FIXED[key])
+                   for key in FIXED)]
     if len(same) < len(rows):
         print(f"[sweep] {len(rows) - len(same)} rows in {csv_path} used other fixed settings and are ignored", flush=True)
     return {row["run_id"]: row for row in same}

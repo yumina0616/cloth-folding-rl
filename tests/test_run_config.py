@@ -32,6 +32,12 @@ class RunConfigTest(unittest.TestCase):
         self.assertEqual((values["cloth_size"], values["cloth_thickness"], values["cloth_density"], values["youngs_modulus"],
                           values["damping"], values["mesh_refinement"]), (0.30, 0.003, 180.0, 1e6, 0.25, 32))
         self.assertNotIn("bend_stiffness", values)  # still being searched (009)
+
+    def test_static_friction_keeps_the_old_values(self):
+        # The hidden "static = dynamic + 0.5 (table + 0.01)" rule was removed; the config states the same values
+        values = MODULE.load_config(MODULE.DEFAULT_CONFIG)
+        for name, gap in (("cloth", 0.5), ("finger", 0.5), ("table", 0.01)):
+            self.assertAlmostEqual(values[f"{name}_static_friction"], values[f"{name}_friction"] + gap)
         self.assertFalse(any(key.startswith("_") for key in values))
 
     def test_file_sets_defaults_and_command_line_wins(self):
