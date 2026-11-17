@@ -28,6 +28,7 @@ from a_single_point_picker import as_tensor
 from virtual_attachment_picker import filter_gripper_contacts
 from physical_picker import create_picker, pinch_vertex
 from rectangular_fold_geometry import rectangular_pairs, pair_distances
+from teleop_height_log import HeightLogger
 from towel_visual import TowelVisual
 from scripts.corner_tracking.cloth_corner_tracker import detect_corner_vertex_indices
 from scripts.learning.teleop_recorder import TeleopRecorder
@@ -137,6 +138,7 @@ class ClothTeleop:
         self.picker = create_picker(self.cloth, self.tcp, grasp_mode=args.grasp_mode, grasp_radius=args.grasp_radius)
         self.towel = TowelVisual(self.cloth, 0.003, ROOT / "assets/materials/towel")
         self.recorder = None
+        self.height_log = HeightLogger(args.height_log_s)
         self.reset()
 
     def tcp(self):
@@ -187,6 +189,8 @@ class ClothTeleop:
         self.completed_actions = 0
         self.grasp_verified = False
         self.grasp_checks = []
+        self.held_start_z = None
+        self.height_log.reset()
         print(f"[teleop] READY {self.episode_id}; pairs={self.pairs}; corners={self.corners().tolist()}", flush=True)
         if self.args.grasp_mode == "physical":
             print(f"[teleop] PHYSICAL: move to inward pinch points={nodes[self.pinch_ids].tolist()}; "
@@ -234,6 +238,7 @@ class ClothTeleop:
             print(f"[teleop] GRASP MISSED: corner {slot}, distance={distance:.3f}m; move closer and press K", flush=True)
             return
         self.recorder.begin_pick_place(current, candidates[slot, :2])
+        self.held_start_z = float(candidates[slot, 2])
         self.action[0, 7] = -1
         self.mode = "carry"
         self.grasp_verified = False
@@ -246,6 +251,7 @@ class ClothTeleop:
             self.action[0, 7] = 1
             self.picker.release()
             self.grasp_verified = False
+            self.held_start_z = None
             # Close the segment after the next regular sample of the open action.
             # Movement remains enabled during this one-step recording boundary.
             self.mode = "physical_release"
@@ -261,6 +267,7 @@ class ClothTeleop:
         if self.picker.grasp(nodes[vertex], vertex_id=vertex):
             self.check_start_z = float(nodes[vertex, 2])
             self.check_tcp_z = float(self.tcp()[2])
+            self.held_start_z = self.check_start_z
         print("[teleop] CLOSE (manual); grasp state is an estimate only", flush=True)
 
     def observe_physical_grasp(self):
@@ -304,6 +311,7 @@ class ClothTeleop:
             if error < 0.08 or error < previous_error:
                 self.target = candidate
         self.step()
+        self.log_height()
         if self.mode == "physical_release":
             self.recorder.end_pick_place(self.corners(), self.place_xy)
             self.completed_actions += 1
@@ -311,6 +319,7 @@ class ClothTeleop:
         elif self.mode == "opening" and self.steps >= self.deadline:
             self.picker.release()
             self.grasp_verified = False
+            self.held_start_z = None
             self.mode = "release_settle"
             self.deadline = self.steps + max(1, round(self.args.settle_seconds / self.dt))
         elif self.mode == "release_settle" and self.steps >= self.deadline:
@@ -328,6 +337,16 @@ class ClothTeleop:
         if not self.finished and self.steps * self.dt >= self.args.max_episode_seconds:
             print("[teleop] Episode time limit reached; discarding and resetting", flush=True)
             self.reset()
+
+    def log_height(self):
+        """Console readout of TCP / cloth / held-node height above the table (--height_log_s)."""
+        logger = getattr(self, "height_log", None)
+        if logger is None:
+            return
+        nodes_z = as_tensor(self.cloth.data.nodal_pos_w)[0, :, 2]
+        held = self.picker.target_position_w if self.picker.is_grasping else None
+        logger.update(self.steps * self.dt, self.args.table_z, float(self.tcp()[2]), float(nodes_z.max()),
+                      None if held is None else float(held[2]), getattr(self, "held_start_z", None))
 
     def write_context(self):
         # Keep the three PR #27 files unchanged. Document conventions alongside them.
@@ -419,6 +438,8 @@ def main():
     parser.add_argument("--max_episode_seconds", type=float, default=600.)
     parser.add_argument("--mesh_refinement", type=float, default=32.)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--height_log_s", type=float, default=.5,
+                        help="Print TCP/cloth heights above the table every N s of sim time when they change; 0 = off")
     parser.add_argument("--smoke_test", action="store_true", help="Finite integration test without keyboard or saved successes")
     add_launcher_args(parser)
     if "--smoke_test" not in sys.argv:
@@ -426,6 +447,8 @@ def main():
     args, hydra_args = setup_preset_cli(parser)
     if args.output_dir is None:
         args.output_dir = ROOT / "runs/teleop" / args.grasp_mode
+    if not math.isfinite(args.height_log_s) or args.height_log_s < 0:
+        parser.error("height_log_s must be 0 (off) or a positive number of seconds")
     if not math.isfinite(args.open_width) or not 0 < args.open_width <= .08:
         parser.error("open_width must be in (0, 0.08] metres")
     for key in ("speed", "grasp_radius", "success_distance", "settle_seconds", "max_episode_seconds", "mesh_refinement"):
@@ -434,6 +457,7 @@ def main():
     args.require_kit = True
     sys.argv = [sys.argv[0], *hydra_args]
     cfg = configure(args)
+    args.table_z = float(cfg.scene.table.init_state.pos[2]) + cfg.scene.table.spawn.size[2] / 2
     with launch_simulation(cfg, args):
         import omni.kit.app
 
