@@ -44,11 +44,22 @@ def fold_success(corners, pairs, threshold=0.02):
     return (distances <= threshold).all(dim=-1)
 
 
-def cloth_dropped(nodes, table_z, margin=0.05):
-    """True where any cloth vertex fell more than margin below the table top. nodes (N, V, 3) -> (N,) bool."""
-    z_coords = nodes[:, :, 2]
-    min_z = z_coords.min(dim=-1).values
-    return min_z < (table_z - margin)
+def cloth_dropped(carried_z, hand_z, grasping, table_z=0.0, drop_height=0.01, drop_hand_height=0.06):
+    """True where the carried corner fell onto the table while the hand is still up -> (N,) bool.
+
+    Same rule as scripts/grasp/rectangular_fold_demo.py (--drop_height, --drop_hand_height):
+    the held corner is less than drop_height above the table while the TCP is more than
+    drop_hand_height above it. When the hand comes down with the corner at the end of the
+    fold, both are low, so that is not counted as a drop.
+
+    carried_z: (N,) world z of the held corner [m] (physical picker: the corner's real position)
+    hand_z:    (N,) world z of the TCP [m]
+    grasping:  (N,) bool, only environments that are holding a corner can drop it
+    table_z:   table top height [m]; 0 in the Isaac Lab cloth task (table_top_z in the demo)
+    """
+    corner_on_table = (carried_z - table_z) < drop_height
+    hand_up = (hand_z - table_z) > drop_hand_height
+    return grasping & corner_on_table & hand_up
 
 
 def fold_reward(previous_corners, current_corners, pairs, success, dropped):

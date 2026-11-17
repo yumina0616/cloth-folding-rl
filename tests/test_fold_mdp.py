@@ -77,6 +77,17 @@ def test_fold_success_needs_every_pair():
 
 
 def test_cloth_dropped():
-    nodes = torch.zeros(2, 10, 3)
-    nodes[1, 3, 2] = -0.1  # 환경 1의 정점 하나만 테이블 0.1 m 아래
-    assert cloth_dropped(nodes, table_z=0.0).tolist() == [False, True]
+    # env 0: corner carried high          -> not dropped
+    # env 1: corner on table, hand up     -> dropped
+    # env 2: corner and hand both low     -> end of fold, not dropped
+    # env 3: same as env 1 but not grasping -> nothing to drop
+    carried_z = torch.tensor([0.10, 0.005, 0.005, 0.005])
+    hand_z = torch.tensor([0.15, 0.15, 0.03, 0.15])
+    grasping = torch.tensor([True, True, True, False])
+    assert cloth_dropped(carried_z, hand_z, grasping).tolist() == [False, True, False, False]
+
+
+def test_cloth_dropped_uses_table_height():
+    # Same heights as env 1 above, shifted by a table at z = 0.5
+    dropped = cloth_dropped(torch.tensor([0.505]), torch.tensor([0.65]), torch.tensor([True]), table_z=0.5)
+    assert dropped.tolist() == [True]
