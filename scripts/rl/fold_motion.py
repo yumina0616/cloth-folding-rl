@@ -1,7 +1,7 @@
 """Batched hand goals for one pick-and-place, as pure tensor math (no Isaac Sim).
 
-Same motion as the virtual fold demo (scripts/grasp/rectangular_fold_demo.py, place_corner):
-approach 8 cm above, descend to 1.5 cm above the corner, carry along a raised arc, lower, release.
+Same motion as the fold demo (scripts/grasp/rectangular_fold_demo.py, place_corner):
+approach 8 cm above, descend, carry along a raised arc, lower, release.
 The only difference: the policy gives WHERE the held corner should land (place_xy), instead of
 "onto corner number k". The demo follows the destination corner while it moves; here the
 place point is fixed when the decision is made, so the policy has to anticipate that motion.
@@ -35,25 +35,33 @@ def placement_clearance(cloth_thickness):
     return max(0.003, cloth_thickness + 0.001)
 
 
-def carry_arc_goals(start_corner, place_point, offset, lift_height, cloth_thickness, segments=ARC_SEGMENTS):
-    """TCP goals that carry the held corner along a raised arc to place_point. -> (segments, N, 3).
+def carry_arc_corner_points(start_corner, place_point, lift_height, cloth_thickness, segments=ARC_SEGMENTS):
+    """Where the HELD CORNER should be at each arc waypoint. -> (segments, N, 3).
 
-    start_corner: (N, 3) held corner when the carry starts
+    start_corner: (N, 3) held corner when the carry starts (physical grasp: height before the grasp check lift)
     place_point:  (N, 3) where the held corner should land (z = resting height of the corner)
-    offset:       (N, 3) held corner - TCP, measured right after the grasp (virtual grasp keeps it fixed)
     Arc height = max(lift_height, half the horizontal span), as in the demo (not the low correction arc).
     """
     span = torch.linalg.vector_norm(place_point[:, :2] - start_corner[:, :2], dim=-1)  # (N,)
     arc_height = torch.clamp(span / 2, min=lift_height)                                 # (N,)
     clearance = placement_clearance(cloth_thickness)
-    goals = []
+    points = []
     for segment in range(1, segments + 1):
         t = segment / segments
         alpha = (1 - math.cos(math.pi * t)) / 2
-        node_goal = torch.lerp(start_corner, place_point, alpha)
-        node_goal[:, 2] += arc_height * math.sin(math.pi * t) + clearance * alpha
-        goals.append(node_goal - offset)
-    return torch.stack(goals)
+        point = torch.lerp(start_corner, place_point, alpha)
+        point[:, 2] += arc_height * math.sin(math.pi * t) + clearance * alpha
+        points.append(point)
+    return torch.stack(points)
+
+
+def carry_arc_goals(start_corner, place_point, offset, lift_height, cloth_thickness, segments=ARC_SEGMENTS):
+    """TCP goals for the arc with a FIXED offset (virtual grasp). -> (segments, N, 3).
+
+    offset: (N, 3) held corner - TCP. The virtual grasp keeps it fixed; the physical grasp does not
+    (the corner slides in the fingers), so the executor subtracts the live offset per waypoint instead.
+    """
+    return carry_arc_corner_points(start_corner, place_point, lift_height, cloth_thickness, segments) - offset
 
 
 def lower_goal(place_point, offset, cloth_thickness):

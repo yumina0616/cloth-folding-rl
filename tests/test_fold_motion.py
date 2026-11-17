@@ -82,3 +82,14 @@ def test_inputs_are_not_modified():
     lower_goal(place, offset, THICK)
     assert all(torch.equal(a, b) for a, b in zip(before, (start, place, offset)))
     assert math.isclose(placement_clearance(0.001), 0.003)
+
+
+def test_corner_points_minus_offset_equals_fixed_offset_goals():
+    # Physical grasp subtracts a live offset per waypoint; with a constant offset it must match the virtual goals
+    from scripts.rl.fold_motion import carry_arc_corner_points
+    start = torch.tensor([[0.3, -0.2, 0.0015], [0.4, -0.2, 0.0015]])
+    place = torch.tensor([[0.3, 0.1, 0.0015], [0.4, 0.05, 0.0015]])
+    offset = torch.tensor([[0.0, 0.0, -0.015], [0.02, 0.0, -0.01]])
+    points = carry_arc_corner_points(start, place, lift_height=0.12, cloth_thickness=THICK)
+    goals = carry_arc_goals(start, place, offset, lift_height=0.12, cloth_thickness=THICK)
+    assert torch.allclose(points - offset, goals, atol=TOL)

@@ -1,17 +1,28 @@
 """Run "grasp a corner" and "place the held corner at (x, y)" in N environments at once.
 
-Needs Isaac Sim (run through the Isaac Lab launcher). Virtual grasp only for now.
+Needs Isaac Sim (run through the Isaac Lab launcher). grasp_mode = "physical" (default) or "virtual".
 
 Why every environment moves in lockstep: Isaac Lab steps all N environments in one physics
 scene, and env.step() takes one action row per environment. So each call below runs the same
 number of physics steps in every environment. Environments that are not taking part
 (active = False) keep their hand where it is and just wait.
 
+Motion and numbers follow scripts/grasp/rectangular_fold_demo.py (PR #28 version for the physical grasp):
+    physical: approach 8 cm above the pinch point (just inside the corner, chosen on the flat cloth),
+              descend with the fingertips on the cloth, close, grasp check (slow 6 cm lift and hold;
+              the corner must rise >= 15 mm), one retry, carry with the LIVE corner-to-hand offset,
+              watch slip and drop while carrying.
+    virtual:  descend to 1.5 cm above the corner, close, attach the corner vertex (no check).
+Differences from the demo: the place point is the (x, y) given by the policy, fixed at decision time
+(the demo follows the destination corner, and its physical default "mirror" placement needs a
+destination corner, so it is not used); a miss or a failed grasp is returned, not raised.
+
 Typical use (see run_executor_smoke.py):
-    configure_virtual_fold_cfg(cfg, num_envs)          # before gym.make
-    executor = BatchedFoldExecutor(env, ...)            # after env.reset()
-    ok = executor.grasp_corner(source)                  # source: (N,) corner number 0-3
-    executor.place_held_corner(place_xy, active=ok)     # place_xy: (N, 2) where the corner should land
+    configure_fold_cfg(cfg, num_envs, grasp_mode="physical")   # before gym.make
+    executor = BatchedFoldExecutor(env, grasp_mode="physical")  # after env.reset()
+    executor.detect_corners()                                   # once, on the flat cloth
+    ok, info = executor.grasp_corner(source)                    # source: (N,) corner number 0-3
+    miss, info = executor.place_held_corner(place_xy, active=ok)  # place_xy: (N, 2) where the corner lands
 """
 from __future__ import annotations
 
@@ -28,17 +39,18 @@ for folder in (ROOT, ROOT / "scripts" / "grasp", ROOT / "scripts" / "corner_trac
     if str(folder) not in sys.path:
         sys.path.insert(0, str(folder))
 
-from a_single_point_picker import as_tensor  # noqa: E402
 from cloth_corner_tracker import detect_corner_vertex_indices  # noqa: E402
-from virtual_attachment_picker import create_picker  # noqa: E402
+from physical_picker import as_tensor, create_picker, pinch_vertex  # noqa: E402
 
+from scripts.rl.fold_mdp import cloth_dropped  # noqa: E402
 from scripts.rl.fold_motion import (  # noqa: E402
     APPROACH_HEIGHT, RETREAT_HEIGHT, TOUCH_HEIGHT,
-    carry_arc_goals, lower_goal, place_point_from_xy, smoothstep_path,
+    carry_arc_corner_points, lower_goal, place_point_from_xy, smoothstep_path,
 )
 
-REACH_TOLERANCE = 0.005  # m, same as the demo's move()
-DOWN_QUAT = (1.0, 0.0, 0.0, 0.0)  # world hand orientation the demo uses for the approach
+REACH_TOLERANCE = 0.005           # m, same as the demo's move()
+DOWN_QUAT = (1.0, 0.0, 0.0, 0.0)  # world hand orientation for the approach (demo, hand yaw 0)
+GRASP_MODES = ("physical", "virtual")
 
 
 def filter_gripper_contacts_all_envs(env, env_ids=None):
@@ -51,7 +63,6 @@ def filter_gripper_contacts_all_envs(env, env_ids=None):
 
     stage = env.sim.stage
     hand_names = ("panda_hand", "panda_leftfinger", "panda_rightfinger")
-    count = 0
     for root in env.scene.env_prim_paths:
         robot_root = stage.GetPrimAtPath(root + "/Robot")
         hand_paths = [prim.GetPath() for prim in Usd.PrimRange(robot_root, Usd.TraverseInstanceProxies())
@@ -65,31 +76,44 @@ def filter_gripper_contacts_all_envs(env, env_ids=None):
             targets = UsdPhysics.FilteredPairsAPI.Apply(prim).CreateFilteredPairsRel()
             for path in hand_paths:
                 targets.AddTarget(path)
-        count += 1
-    print(f"[executor] filtered gripper-cloth contacts in {count} environments", flush=True)
+    print(f"[executor] filtered gripper-cloth contacts in {len(env.scene.env_prim_paths)} environments", flush=True)
 
 
-def configure_virtual_fold_cfg(cfg, num_envs):
-    """Task settings the virtual fold needs, copied from rectangular_fold_demo.py (virtual grasp).
-
-    Cloth material and size are left to the caller.
-    """
+def configure_fold_cfg(cfg, num_envs, *, grasp_mode="physical", open_width=0.04, finger_friction=1.5,
+                       finger_static_friction=2.0, gripper_effort=70.0):
+    """Task settings the fold needs, copied from rectangular_fold_demo.py. Cloth/table material is left to the caller."""
+    import isaaclab.sim as sim_utils
     from isaaclab.managers import EventTermCfg
 
+    if grasp_mode not in GRASP_MODES:
+        raise ValueError(f"grasp_mode must be one of {GRASP_MODES}")
     cfg.scene.num_envs = num_envs
-    cfg.decimation = 1             # one env.step = one physics step, so the picker updates every step
+    cfg.decimation = 1             # one env.step = one physics step
     cfg.episode_length_s = 300.0   # long enough that time_out never cuts a fold short
     cfg.scene.support_neg_y = None
     cfg.scene.support_pos_y = None
     cfg.scene.table.spawn.visible = True
     cfg.events.reset_deformable = None
-    cfg.events.virtual_grasp_contacts = EventTermCfg(func=filter_gripper_contacts_all_envs, mode="prestartup")
+    if grasp_mode == "virtual":
+        # The attachment holds the cloth, so the fingers must not push it
+        cfg.events.virtual_grasp_contacts = EventTermCfg(func=filter_gripper_contacts_all_envs, mode="prestartup")
+    else:
+        # Finger contact and friction hold the cloth (008 gripper settings, demo PR #28)
+        cfg.scene.robot.spawn.make_uninstanceable = True
+        cfg.scene.robot.spawn.physics_material = sim_utils.RigidBodyMaterialCfg(
+            static_friction=finger_static_friction, dynamic_friction=finger_friction,
+            restitution=0.0, friction_combine_mode="max")
+        cfg.scene.robot.actuators["panda_hand"].joint_effort_limit = gripper_effort
+        cfg.scene.robot.actuators["panda_hand"].stiffness = 500.0
+        cfg.scene.robot.actuators["panda_hand"].damping = 100.0
     cfg.events.reset_robot_arm_joints.params["position_range"] = (1.0, 1.0)
     cfg.curriculum.gravity = None
     cfg.curriculum.action_rate = None
     cfg.commands.deformable_pose.debug_vis = False
     cfg.commands.deformable_pose.success_vis_asset_name = "__disabled__"
     cfg.actions = type(cfg)().actions.ik
+    if grasp_mode == "physical":
+        cfg.actions.gripper_action.open_command_expr = {"panda_finger_joint1": open_width / 2}  # one joint = one finger
     cfg.actions.arm_action.body_offset.pos = (0.0, 0.0, 0.1034)  # measured TCP used by ee_frame
     cfg.actions.arm_action.controller.ik_params = {"lambda_val": 0.1}
     for name in vars(cfg.terminations):
@@ -99,18 +123,33 @@ def configure_virtual_fold_cfg(cfg, num_envs):
 
 
 class BatchedFoldExecutor:
-    def __init__(self, env, *, table_z=0.0, cloth_thickness=0.003, lift_height=0.12,
-                 grasp_radius=0.03, settle_seconds=3.0):
+    def __init__(self, env, *, grasp_mode="physical", table_z=0.0, cloth_thickness=0.003, lift_height=0.12,
+                 settle_seconds=3.0, grasp_radius=None,
+                 # physical grasp (demo defaults, experiment 008 / PR #28)
+                 open_width=0.04, pad_half=0.01, edge_margin=0.005, press_depth=0.0,
+                 grasp_settle_s=0.5, check_lift=0.06, check_lift_s=2.0, check_hold_s=1.0,
+                 check_min_rise=0.015, quality_max=0.0, retries=1,
+                 slip_drift=0.02, drop_height=0.01, drop_hand_height=0.06):
+        if grasp_mode not in GRASP_MODES:
+            raise ValueError(f"grasp_mode must be one of {GRASP_MODES}")
         self.env = env
         self.base = env.unwrapped
         scene = self.base.scene
         self.cloth, self.ee, self.robot = scene["deformable"], scene["ee_frame"], scene["robot"]
         self.num_envs = self.base.num_envs
         self.device = self.base.device
-        self.table_z = table_z
-        self.cloth_thickness = cloth_thickness
-        self.lift_height = lift_height
-        self.settle_steps = math.ceil(settle_seconds / self.base.physics_dt)
+        self.physical = grasp_mode == "physical"
+        self.grasp_mode = grasp_mode
+        self.table_z, self.cloth_thickness, self.lift_height = table_z, cloth_thickness, lift_height
+        dt = self.base.physics_dt
+        self.settle_steps = math.ceil(settle_seconds / dt)
+        self.open_width, self.pad_half, self.edge_margin, self.press_depth = open_width, pad_half, edge_margin, press_depth
+        self.grasp_settle_steps = math.ceil(grasp_settle_s / dt)
+        self.check_lift, self.check_lift_steps = check_lift, max(1, math.ceil(check_lift_s / dt))
+        self.check_hold_steps = math.ceil(check_hold_s / dt)
+        self.check_min_rise, self.quality_max = check_min_rise, quality_max
+        self.retries = retries if self.physical else 0
+        self.slip_drift, self.drop_height, self.drop_hand_height = slip_drift, drop_height, drop_hand_height
 
         self.action = torch.zeros(self.base.action_space.shape, device=self.device)
         if self.action.shape != (self.num_envs, 8):
@@ -120,12 +159,22 @@ class BatchedFoldExecutor:
         self.action[:, 7] = 1.0  # gripper open
         self._write_pose()
 
-        # One picker per environment; each attaches one vertex of its own cloth
-        self.pickers = [create_picker(self.cloth, (lambda i=i: self.tcp()[i]), env_id=i, grasp_radius=grasp_radius)
-                        for i in range(self.num_envs)]
-        self.offset = torch.zeros(self.num_envs, 3, device=self.device)  # held corner - TCP
-        self.held_corner = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
-        self.corner_indices = None  # (N, 4) mesh vertex of each corner, found on the flat cloth
+        # One picker per environment. Physical: tracks the held corner (6 cm reach, the pinch point is
+        # about 4 cm from the corner). Virtual: attaches the corner vertex to the hand.
+        radius = grasp_radius if grasp_radius is not None else (0.06 if self.physical else 0.03)
+        self.pickers = [create_picker(self.cloth, (lambda i=i: self.tcp()[i]), grasp_mode=grasp_mode,
+                                      env_id=i, grasp_radius=radius) for i in range(self.num_envs)]
+        n = self.num_envs
+        self.offset = torch.zeros(n, 3, device=self.device)       # held corner - TCP (virtual: fixed)
+        self.grasp_offset = torch.zeros(n, 3, device=self.device) # offset right after the grasp, for slip
+        self.held_corner = torch.full((n,), -1, dtype=torch.long, device=self.device)
+        self.check_rise = torch.zeros(n, device=self.device)      # how much the grasp check lifted the corner
+        self.corner_indices = None   # (N, 4) mesh vertex of each corner, found on the flat cloth
+        self.pinch_indices = None    # (N, 4) physical: vertex just inside each corner where the fingers close
+        # Transport monitoring (physical), updated every physics step while carrying
+        self._carrying = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.dropped = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.max_drift = torch.zeros(n, device=self.device)
 
     # ---------- reading state ----------
     def nodes(self):
@@ -134,16 +183,39 @@ class BatchedFoldExecutor:
     def tcp(self):
         return as_tensor(self.ee.data.target_pos_w)[:, 0]  # (N, 3)
 
+    def _vertices(self, index):
+        """Positions of one vertex per environment: index (N,) -> (N, 3)."""
+        return torch.gather(self.nodes(), 1, index.view(-1, 1, 1).expand(-1, 1, 3))[:, 0]
+
     def detect_corners(self):
         """Call once on the flat cloth (after env.reset() and a short hold)."""
         nodes = self.nodes()
         self.corner_indices = torch.stack([detect_corner_vertex_indices(nodes[i]) for i in range(self.num_envs)])
+        if self.physical:
+            pinch = []
+            for i in range(self.num_envs):
+                flat_xy = nodes[i, :, :2].clone()
+                center_xy = nodes[i, self.corner_indices[i], :2].mean(dim=0)
+                pinch.append([pinch_vertex(flat_xy, int(v), center_xy, self.open_width, pad_half=self.pad_half,
+                                           edge_margin=self.edge_margin, jaw_axis="y")
+                              for v in self.corner_indices[i].tolist()])
+            self.pinch_indices = torch.tensor(pinch, dtype=torch.long, device=self.device)
         return self.corner_indices
 
     def corners(self):
         """(N, 4, 3) world positions of the four tracked corners."""
-        nodes = self.nodes()
-        return torch.gather(nodes, 1, self.corner_indices.unsqueeze(-1).expand(-1, -1, 3))
+        return torch.gather(self.nodes(), 1, self.corner_indices.unsqueeze(-1).expand(-1, -1, 3))
+
+    def grasp_target(self, source):
+        """Where the TCP goes down: the pinch vertex just inside the corner (physical) or the corner (virtual)."""
+        rows = torch.arange(self.num_envs, device=self.device)
+        table = self.pinch_indices if self.physical else self.corner_indices
+        return self._vertices(table[rows, source]).clone()
+
+    def held_corner_position(self):
+        """(N, 3) current position of the corner each environment holds (garbage where nothing is held)."""
+        rows = torch.arange(self.num_envs, device=self.device)
+        return self._vertices(self.corner_indices[rows, self.held_corner.clamp(min=0)])
 
     # ---------- low-level motion (all environments together) ----------
     def _write_pose(self, position_w=None, quat_w=None):
@@ -157,10 +229,26 @@ class BatchedFoldExecutor:
 
     def step(self):
         for picker in self.pickers:
-            picker.update(dt=self.base.physics_dt)  # attachment backend: update BEFORE the physics step
+            if picker.backend in ("kinematic", "physx_attachment"):
+                picker.update(dt=self.base.physics_dt)  # before the physics step
         _, _, terminated, truncated, _ = self.env.step(self.action)
         if bool(terminated.any()) or bool(truncated.any()):
             raise RuntimeError("An environment ended during a pick-and-place; increase episode_length_s")
+        for picker in self.pickers:
+            if picker.backend == "state_projection":
+                picker.update(dt=self.base.physics_dt)  # after the cloth solver
+        if self.physical and bool(self._carrying.any()):
+            self._watch_transport()
+
+    def _watch_transport(self):
+        """Physical carry: record slip (corner moving in the fingers) and drop (same rule as fold_mdp / demo)."""
+        corner = self.held_corner_position()
+        drift = torch.linalg.vector_norm((corner - self.tcp()) - self.grasp_offset, dim=-1)
+        self.max_drift = torch.where(self._carrying, torch.maximum(self.max_drift, drift), self.max_drift)
+        dropped_now = cloth_dropped(corner[:, 2], self.tcp()[:, 2], self._carrying, table_z=self.table_z,
+                                    drop_height=self.drop_height, drop_hand_height=self.drop_hand_height)
+        self.dropped |= dropped_now
+        self._carrying &= ~dropped_now  # a dropped environment stops being watched
 
     def hold(self, count):
         for _ in range(count):
@@ -171,14 +259,14 @@ class BatchedFoldExecutor:
 
         Returns the remaining TCP error per environment (N,) [m]; inactive environments report 0.
         Unlike the demo this does not raise on a miss, so one environment cannot stop the others.
+        max_wait: extra steps to let the hand arrive (the demo uses 60 when the fingers may touch something).
         """
         active = self._mask(active)
         goal = torch.where(active[:, None], goal_w, self.target_w)
         goal_quat = self.target_quat_w.clone()
         if goal_quat_w is not None:
             goal_quat = torch.where(active[:, None], goal_quat_w.expand_as(goal_quat), goal_quat)
-        # Take the short way round (q and -q are the same rotation)
-        flip = (self.target_quat_w * goal_quat).sum(-1, keepdim=True) < 0
+        flip = (self.target_quat_w * goal_quat).sum(-1, keepdim=True) < 0  # q and -q are the same rotation
         goal_quat = torch.where(flip, -goal_quat, goal_quat)
 
         positions = smoothstep_path(self.target_w, goal, count)
@@ -186,10 +274,9 @@ class BatchedFoldExecutor:
         for position, quat in zip(positions, quats):
             self._write_pose(position, quat / torch.linalg.vector_norm(quat, dim=-1, keepdim=True))
             self.step()
-        self.target_w, self.target_quat_w = goal.clone(), goal_quat / torch.linalg.vector_norm(
-            goal_quat, dim=-1, keepdim=True)
-        # Fixed-duration interpolation alone does not guarantee arrival
-        for _ in range(max_wait):
+        self.target_w = goal.clone()
+        self.target_quat_w = goal_quat / torch.linalg.vector_norm(goal_quat, dim=-1, keepdim=True)
+        for _ in range(max_wait):  # fixed-duration interpolation alone does not guarantee arrival
             error = torch.linalg.vector_norm(self.tcp() - goal, dim=-1) * active
             if bool((error < REACH_TOLERANCE).all()):
                 break
@@ -197,77 +284,146 @@ class BatchedFoldExecutor:
         return torch.linalg.vector_norm(self.tcp() - goal, dim=-1) * active
 
     def set_gripper(self, closed, active=None):
+        """Open/close in active environments. Returns the finger gap per environment after it (N,) [m]."""
         active = self._mask(active)
         # BinaryJointPositionAction: negative = close, positive = open
-        self.action[:, 7] = torch.where(active, torch.full_like(self.action[:, 7], -1.0 if closed else 1.0),
-                                        self.action[:, 7])
+        command = torch.full_like(self.action[:, 7], -1.0 if closed else 1.0)
+        self.action[:, 7] = torch.where(active, command, self.action[:, 7])
         self.hold(max(60, math.ceil(1.0 / self.base.physics_dt)))
+        finger_ids = self.robot.find_joints("panda_finger_joint.*")[0]
+        return as_tensor(self.robot.data.joint_pos)[:, finger_ids].sum(dim=-1)
 
     # ---------- one decision ----------
     def grasp_corner(self, source, active=None):
-        """Pick corner number source (N,) in active environments. Returns ok (N,) bool.
+        """Pick corner number source (N,) in active environments.
 
-        Same steps as the demo: lift to a safe height, approach 8 cm above, descend to 1.5 cm above,
-        close, attach. An environment whose corner is out of reach returns False (the demo raises).
+        Returns ok (N,) bool and info {"attempts": (N,), "rise_m": (N,), "corner_tcp_m": (N,)}.
+        Physical: grasp check after closing, one retry by default; environments that already
+        hold their corner wait while the others retry.
         """
         active = self._mask(active)
         source = source.to(self.device).long()
-        rows = torch.arange(self.num_envs, device=self.device)
-        corner = self.corners()[rows, source]
-        above = corner.clone()
-        above[:, 2] += APPROACH_HEIGHT
-        safe = self.tcp().clone()
-        safe[:, 2] = torch.maximum(safe[:, 2], above[:, 2])  # rise vertically before crossing the cloth
-        self.move(safe, 120, active)
-        self.move(above, 240, active, goal_quat_w=self.action.new_tensor(DOWN_QUAT))
-        touch = self.corners()[rows, source].clone()
-        touch[:, 2] += TOUCH_HEIGHT
-        reach_error = self.move(touch, 180, active)
-        self.set_gripper(True, active)
+        n = self.num_envs
+        ok = torch.zeros(n, dtype=torch.bool, device=self.device)
+        attempts = torch.zeros(n, dtype=torch.long, device=self.device)
+        rise = torch.zeros(n, device=self.device)
+        corner_tcp = torch.zeros(n, device=self.device)
+        for _ in range(1 + self.retries):
+            trying = active & ~ok
+            if not bool(trying.any()):
+                break
+            attempts += trying.long()
+            above = self.grasp_target(source)
+            above[:, 2] += APPROACH_HEIGHT
+            safe = self.tcp().clone()
+            safe[:, 2] = torch.maximum(safe[:, 2], above[:, 2])  # rise vertically before crossing the cloth
+            self.move(safe, 120, trying)
+            self.move(above, 240, trying, goal_quat_w=self.action.new_tensor(DOWN_QUAT))
+            touch = self.grasp_target(source)
+            # Physical: fingertips on the cloth (the table stops them). Virtual: 1.5 cm above the corner.
+            touch[:, 2] += -self.press_depth if self.physical else TOUCH_HEIGHT
+            reach_error = self.move(touch, 180, trying, max_wait=60 if self.physical else 1200)
+            self.set_gripper(True, trying)
 
-        ok = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        corner = self.corners()[rows, source]
-        for i in torch.nonzero(active).flatten().tolist():
-            vertex = int(self.corner_indices[i, source[i]])
-            if reach_error[i] < REACH_TOLERANCE and self.pickers[i].grasp(corner[i], vertex_id=vertex):
-                ok[i] = True
-                self.offset[i] = self.pickers[i].target_position_w - self.tcp()[i]
-                self.held_corner[i] = source[i]
-        return ok
+            attached = torch.zeros(n, dtype=torch.bool, device=self.device)
+            corner = self.corners()[torch.arange(n, device=self.device), source]
+            for i in torch.nonzero(trying).flatten().tolist():
+                if not self.physical and reach_error[i] >= REACH_TOLERANCE:
+                    continue
+                vertex = int(self.corner_indices[i, source[i]])
+                if self.pickers[i].grasp(corner[i], vertex_id=vertex):
+                    attached[i] = True
+                    self.held_corner[i] = source[i]
+            if self.physical:
+                passed, rise_now, corner_tcp_now = self._grasp_check(attached)
+                rise = torch.where(attached, rise_now, rise)
+                corner_tcp = torch.where(attached, corner_tcp_now, corner_tcp)
+            else:
+                passed = attached
+            ok |= passed
+            # Remember the corner-to-hand offset from the settled grip
+            self.offset = torch.where(passed[:, None], self.held_corner_position() - self.tcp(), self.offset)
+            self.grasp_offset = torch.where(passed[:, None], self.offset, self.grasp_offset)
+            failed = trying & ~passed
+            if bool(failed.any()):  # let go and back off before the retry
+                for i in torch.nonzero(failed).flatten().tolist():
+                    self.pickers[i].release()
+                self.held_corner = torch.where(failed, torch.full_like(self.held_corner, -1), self.held_corner)
+                self.set_gripper(False, failed)
+                retreat = self.tcp().clone()
+                retreat[:, 2] += 0.05
+                self.move(retreat, 120, failed, max_wait=60)
+        self.check_rise = torch.where(ok, rise, self.check_rise)
+        return ok, {"attempts": attempts, "rise_m": rise, "corner_tcp_m": corner_tcp}
+
+    def _grasp_check(self, active):
+        """Physical: settle, lift check_lift slowly, hold; the corner must follow. Same rule as the demo."""
+        self.hold(self.grasp_settle_steps)
+        start_z = self.held_corner_position()[:, 2].clone()
+        lift = self.tcp().clone()
+        lift[:, 2] += self.check_lift
+        self.move(lift, self.check_lift_steps, active, max_wait=60)
+        self.hold(self.check_hold_steps)
+        corner = self.held_corner_position()
+        rise = corner[:, 2] - start_z
+        corner_tcp = torch.linalg.vector_norm(corner - self.tcp(), dim=-1)
+        passed = active & (rise >= self.check_min_rise)
+        if self.quality_max > 0:
+            passed &= corner_tcp <= self.quality_max
+        return passed, rise, corner_tcp
 
     def place_held_corner(self, place_xy, active=None):
         """Carry the held corner so it lands at place_xy (N, 2), release, retreat, settle.
 
-        Only environments that are active AND holding a corner move. Returns the signed xy miss of
-        the held corner after settling (N, 2) [m] (0 for environments that did not place).
+        Only environments that are active AND holding a corner move. Returns the signed xy miss of the
+        corner after settling (N, 2) [m] (0 where nothing was placed) and info
+        {"placed": (N,) bool, "dropped": (N,) bool, "max_drift_m": (N,)}.
         """
-        active = self._mask(active) & (self.held_corner >= 0)
+        moving = self._mask(active) & (self.held_corner >= 0)
         rows = torch.arange(self.num_envs, device=self.device)
         source = self.held_corner.clamp(min=0)
         place_point = place_point_from_xy(place_xy.to(self.device), self.table_z, self.cloth_thickness)
-        start = self.corners()[rows, source].clone()
+        start = self.held_corner_position().clone()
+        if self.physical:
+            # The grasp check already lifted the corner: start the arc from the height it had before (demo)
+            start[:, 2] -= self.check_rise
+        self.dropped = torch.where(moving, torch.zeros_like(self.dropped), self.dropped)
+        self.max_drift = torch.where(moving, torch.zeros_like(self.max_drift), self.max_drift)
+        self._carrying = moving.clone()
 
-        for goal in carry_arc_goals(start, place_point, self.offset, self.lift_height, self.cloth_thickness):
-            self.move(goal, 120, active)
-        for _ in range(3):  # the demo lowers three times; the cloth under the corner keeps settling
-            self.move(lower_goal(place_point, self.offset, self.cloth_thickness), 120, active)
-        self.set_gripper(False, active)
-        for i in torch.nonzero(active).flatten().tolist():
+        for point in carry_arc_corner_points(start, place_point, self.lift_height, self.cloth_thickness):
+            if self.physical:  # the corner slides in the fingers, so use where it is now
+                self.offset = torch.where(self._carrying[:, None], self.held_corner_position() - self.tcp(),
+                                          self.offset)
+            self.move(point - self.offset, 120, self._carrying)
+        # Physical: lower three times with a fresh offset (the fingers rest on the cloth below, the hand
+        # cannot reach the goal). Virtual: the offset is fixed, so one lowering is enough.
+        for _ in range(3 if self.physical else 1):
+            if self.physical:
+                self.offset = torch.where(self._carrying[:, None], self.held_corner_position() - self.tcp(),
+                                          self.offset)
+            self.move(lower_goal(place_point, self.offset, self.cloth_thickness), 120, self._carrying,
+                      max_wait=60 if self.physical else 1200)
+        placed = self._carrying.clone()
+        self._carrying.zero_()
+        self.set_gripper(False, moving)
+        for i in torch.nonzero(moving).flatten().tolist():
             self.pickers[i].release()
-        self.held_corner = torch.where(active, torch.full_like(self.held_corner, -1), self.held_corner)
+        self.held_corner = torch.where(moving, torch.full_like(self.held_corner, -1), self.held_corner)
         retreat = self.tcp().clone()
         retreat[:, 2] += RETREAT_HEIGHT
-        self.move(retreat, 180, active)
+        self.move(retreat, 180, moving)
         self.hold(self.settle_steps)
 
-        miss = self.corners()[rows, source, :2] - place_point[:, :2]
-        return miss * active[:, None]
+        miss = (self.corners()[rows, source, :2] - place_point[:, :2]) * placed[:, None]
+        return miss, {"placed": placed, "dropped": self.dropped.clone(), "max_drift_m": self.max_drift.clone()}
 
     def release_all(self):
-        """Drop every attachment; call before env.reset()."""
+        """Drop every grasp; call before env.reset()."""
         for picker in self.pickers:
             picker.release()
         self.held_corner.fill_(-1)
+        self._carrying.zero_()
 
     def _mask(self, active):
         if active is None:
