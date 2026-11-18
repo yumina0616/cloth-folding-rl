@@ -22,3 +22,8 @@
 천 모서리를 집게에 가상으로 연결하고 두 모서리를 순서대로 옮긴 뒤, 두 쌍의 거리가 모두 2cm 이내인지 판정한다.
 [파지 안정성 비교](scripts/grasp/README_grasp_stability.md)와 성공한 실행의 영상·시연 기록 저장을 포함한다.
 학습된 정책이나 접촉 마찰 기반 물리 파지를 구현한 결과는 아니다.
+
+## 키보드 teleoperation
+
+[키보드 천 접기 및 시연 저장](scripts/grasp/README_teleop_cloth.md)을 참고한다.
+가상 파지로 직접 조작하고, 성공한 시연을 PR #27 공통 Recorder 규격으로 저장한다.
