@@ -29,6 +29,7 @@ from virtual_attachment_picker import filter_gripper_contacts
 from physical_picker import create_picker, pinch_vertex
 from rectangular_fold_geometry import rectangular_pairs, pair_distances
 from teleop_height_log import HeightLogger
+from teleop_pinch_guide import GREEN, RED, marker_color, next_source_slot, pair_with_source, xy_distance
 from towel_visual import TowelVisual
 from scripts.corner_tracking.cloth_corner_tracker import detect_corner_vertex_indices
 from scripts.learning.teleop_recorder import TeleopRecorder
@@ -88,6 +89,18 @@ def configure(args):
     return cfg
 
 
+def create_pinch_marker():
+    """One visual-only sphere (no collision) with a red and a green prototype."""
+    from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+
+    colors = {RED: (1.0, 0.1, 0.1), GREEN: (0.1, 0.9, 0.1)}
+    return VisualizationMarkers(VisualizationMarkersCfg(
+        prim_path="/Visuals/PinchPoint",
+        markers={name: sim_utils.SphereCfg(radius=0.004, visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=colors[index]))
+                 for index, name in ((RED, "far"), (GREEN, "on_point"))},
+    ))
+
+
 class KeyboardInput:
     """Use Kit's input events; repeats cannot accumulate motion or toggle twice."""
 
@@ -139,6 +152,7 @@ class ClothTeleop:
         self.towel = TowelVisual(self.cloth, 0.003, ROOT / "assets/materials/towel")
         self.recorder = None
         self.height_log = HeightLogger(args.height_log_s)
+        self.pinch_marker = create_pinch_marker() if args.pinch_marker else None
         self.reset()
 
     def tcp(self):
@@ -190,6 +204,8 @@ class ClothTeleop:
         self.grasp_verified = False
         self.grasp_checks = []
         self.held_start_z = None
+        self.initial_corners_xy = self.corners()[:, :2].clone()
+        self.active_pair = None
         self.height_log.reset()
         print(f"[teleop] READY {self.episode_id}; pairs={self.pairs}; corners={self.corners().tolist()}", flush=True)
         if self.args.grasp_mode == "physical":
@@ -239,6 +255,7 @@ class ClothTeleop:
             return
         self.recorder.begin_pick_place(current, candidates[slot, :2])
         self.held_start_z = float(candidates[slot, 2])
+        self.active_pair = pair_with_source(self.pairs, slot)
         self.action[0, 7] = -1
         self.mode = "carry"
         self.grasp_verified = False
@@ -258,6 +275,7 @@ class ClothTeleop:
             print("[teleop] OPEN (manual)", flush=True)
             return
         self.recorder.begin_pick_place(self.corners(), self.tcp()[:2])
+        self.active_pair = self.next_pair()
         self.action[0, 7] = -1
         self.mode = "carry"
         self.grasp_verified = False
@@ -311,7 +329,8 @@ class ClothTeleop:
             if error < 0.08 or error < previous_error:
                 self.target = candidate
         self.step()
-        self.log_height()
+        guide, distance = self.update_pinch_marker()
+        self.log_height(distance, guide)
         if self.mode == "physical_release":
             self.recorder.end_pick_place(self.corners(), self.place_xy)
             self.completed_actions += 1
@@ -338,7 +357,48 @@ class ClothTeleop:
             print("[teleop] Episode time limit reached; discarding and resetting", flush=True)
             self.reset()
 
-    def log_height(self):
+    def next_pair(self):
+        slot = next_source_slot(self.pairs, self.initial_corners_xy, self.corners()[:, :2])
+        return None if slot is None else pair_with_source(self.pairs, slot)
+
+    def update_pinch_marker(self):
+        """One sphere, red -> green within --pinch_tolerance in x-y. Returns (label, x-y distance) or (None, None).
+
+        Fingers open: next pinch point vs TCP. Fingers closed: the destination of the pair grasped
+        (latched at close) vs the held cloth point, drawn at hand height so the lifted cloth never hides it.
+        """
+        marker = getattr(self, "pinch_marker", None)
+        target = None
+        if hasattr(self, "initial_corners_xy") and not self.finished:
+            nodes = as_tensor(self.cloth.data.nodal_pos_w)[0]
+            if float(self.action[0, 7]) > 0:                       # fingers open: where to grasp
+                self.active_pair = None
+                pair = self.next_pair()
+                if pair is not None:
+                    point = nodes[self.pinch_ids[pair[0]]]
+                    target = ("pinch", point, self.tcp(), point)
+            elif getattr(self, "active_pair", None) is not None:   # fingers closed: where to put it down
+                destination = self.active_pair[1]
+                virtual = self.args.grasp_mode == "virtual"
+                point = self.corners()[destination] if virtual else nodes[self.pinch_ids[destination]]
+                held = self.picker.target_position_w if self.picker.is_grasping else None
+                probe = self.tcp() if held is None else held
+                shown = point.clone()
+                shown[2] = self.tcp()[2]
+                target = ("place", point, probe, shown)
+        if target is None:
+            if marker is not None:
+                marker.set_visibility(False)
+            return None, None
+        label, point, probe, shown = target
+        distance = xy_distance(probe, point)
+        if marker is not None:
+            marker.set_visibility(True)
+            marker.visualize(translations=shown.view(1, 3),
+                             marker_indices=[marker_color(distance, self.args.pinch_tolerance)])
+        return label, distance
+
+    def log_height(self, pinch_xy=None, guide="pinch"):
         """Console readout of TCP / cloth / held-node height above the table (--height_log_s)."""
         logger = getattr(self, "height_log", None)
         if logger is None:
@@ -346,7 +406,8 @@ class ClothTeleop:
         nodes_z = as_tensor(self.cloth.data.nodal_pos_w)[0, :, 2]
         held = self.picker.target_position_w if self.picker.is_grasping else None
         logger.update(self.steps * self.dt, self.args.table_z, float(self.tcp()[2]), float(nodes_z.max()),
-                      None if held is None else float(held[2]), getattr(self, "held_start_z", None))
+                      None if held is None else float(held[2]), getattr(self, "held_start_z", None), pinch_xy,
+                      guide or "pinch")
 
     def write_context(self):
         # Keep the three PR #27 files unchanged. Document conventions alongside them.
@@ -438,6 +499,9 @@ def main():
     parser.add_argument("--max_episode_seconds", type=float, default=600.)
     parser.add_argument("--mesh_refinement", type=float, default=32.)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--pinch_marker", type=int, choices=[0, 1], default=1,
+                        help="Sphere on the next pinch point, red -> green when the TCP is on it in x-y; 0 = off (e.g. camera capture)")
+    parser.add_argument("--pinch_tolerance", type=float, default=.005, help="x-y distance in m that turns the pinch marker green")
     parser.add_argument("--height_log_s", type=float, default=.5,
                         help="Print TCP/cloth heights above the table every N s of sim time when they change; 0 = off")
     parser.add_argument("--smoke_test", action="store_true", help="Finite integration test without keyboard or saved successes")
@@ -447,6 +511,8 @@ def main():
     args, hydra_args = setup_preset_cli(parser)
     if args.output_dir is None:
         args.output_dir = ROOT / "runs/teleop" / args.grasp_mode
+    if not math.isfinite(args.pinch_tolerance) or args.pinch_tolerance <= 0:
+        parser.error("pinch_tolerance must be a positive distance in metres")
     if not math.isfinite(args.height_log_s) or args.height_log_s < 0:
         parser.error("height_log_s must be 0 (off) or a positive number of seconds")
     if not math.isfinite(args.open_width) or not 0 < args.open_width <= .08:

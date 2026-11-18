@@ -52,3 +52,13 @@ def test_zero_interval_turns_it_off_and_reset_prints_again():
     logger.reset()                       # new episode: time restarts at 0
     logger.update(0.0, 0.0, 0.1, 0.0)
     assert len(lines) == 2
+
+
+def test_line_ends_with_pinch_distance_in_mm():
+    line = height_line(0.0, tcp_z=0.04, cloth_max_z=0.0015, pinch_xy=0.0042)
+    assert line.endswith("| pinch xy    4 mm")
+
+
+def test_place_guide_is_labelled():
+    line = height_line(0.0, tcp_z=0.035, cloth_max_z=0.03, pinch_xy=0.012, guide="place")
+    assert line.endswith("| place xy   12 mm")
