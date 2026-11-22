@@ -39,6 +39,9 @@ from physical_picker import create_picker, pinch_vertex
 from finger_pad_probe import probe_finger_pads
 from run_config import DEFAULT_CONFIG, apply_config_defaults
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "corner_tracking"))
+# Project root, for the shared dataset recorder in scripts/learning (same as main's fold demo)
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from fold_dataset_export import FoldEpisodeLog, fold_context
 from cloth_corner_tracker import detect_corner_vertex_indices, get_corner_world_positions
 from rectangular_fold_geometry import rectangular_pairs, pair_distances
 from successful_video import gate_video_recorders
@@ -287,6 +290,7 @@ def main():
               "cloth_start": [args.start_x, args.start_y], "grasps": []}
     transport = {"max_drift_m": 0.0, "slip_phase": None}
     rows = []
+    episode_log = FoldEpisodeLog()  # every step, saved in the PR #37 BC format for successful runs
     phase = "initialization"
     step_index = 0
     corner_indices = None
@@ -384,6 +388,11 @@ def main():
                     # Pre-step-only writes are undone by the stiff cloth solver.
                     picker.update(dt=base.physics_dt)
                 step_index += 1
+                if corner_indices is not None:
+                    # Row written after the step, with the command actually sent (teleop convention)
+                    episode_log.append(step_index * base.physics_dt, phase, action[0],
+                                       as_tensor(robot.data.joint_pos)[0], corners(), anchor(),
+                                       picker.is_grasping)
                 # Correction approach: stop if the cloth already folded itself (all pairs in tolerance)
                 # Only while the hand is still on its way (approach/descend), never once the fingers close
                 if (phase.startswith("correction_") and phase.endswith(("_approach", "_descend"))
@@ -550,6 +559,8 @@ def main():
                         record["close_lift_mm"] = round(args.close_lift * 1000, 1)
                     phase = f"{number}_grasp"
                     record["open_gap_m"] = float(as_tensor(robot.data.joint_pos)[0, finger_ids].sum())
+                    # Dataset: pick = TCP xy at close (physical) or the corner (virtual), as in teleop
+                    episode_log.begin(corners(), anchor()[:2] if physical else corners()[source, :2])
                     set_gripper(closed=True)
                     record["gap_closed_mm"] = round(float(as_tensor(robot.data.joint_pos)[0, finger_ids].sum()) * 1000, 1)
                     current = corners()[source].clone()
@@ -559,7 +570,9 @@ def main():
                         record.update(ok=False, reason="gripper_not_near_corner")
                     elif not physical:
                         record.update(ok=True)
+                        episode_log.start_carry()
                     else:
+                        episode_log.start_carry()  # the grasp-check lift is the start of the learned carry
                         record["offset_at_close_mm"] = [round(float(v) * 1000, 1) for v in picker.corner_offset()]
                         record.update(grasp_check(source, number))
                         if record["ok"]:
@@ -568,6 +581,7 @@ def main():
                     print(f"[fold] grasp {number} attempt {attempt + 1}: {record}", flush=True)
                     if record["ok"]:
                         break
+                    episode_log.abandon()  # failed attempt: kept as grasp_retry, not trained as carry
                     picker.release()
                     set_gripper(closed=False)
                     if not args.retry_in_place:
@@ -648,9 +662,12 @@ def main():
                     return [round(float(v) * 1000, 1) for v in (corners()[source] - corners()[destination])[:2]]
 
                 record["err_before_open_mm"] = placed_error_mm()
+                episode_log.begin_release(anchor()[:2])  # place = TCP xy right before opening
                 set_gripper(closed=False)
                 record["err_after_open_mm"] = placed_error_mm()
                 picker.release()
+                pair_index = next(i for i, p in enumerate(pairs) if tuple(p) == (source, destination))
+                episode_log.end(corners(), pair_index, correction=correction)
                 phase = f"{number}_retreat"
                 retreat = anchor().clone()
                 retreat[2] += 0.10
@@ -801,6 +818,20 @@ def main():
                                             corners_w=np.stack([r[4] for r in rows]),
                                             tcp_w=np.stack([r[5] for r in rows]),
                                             grasping=np.array([r[6] for r in rows]))
+                if (result["success"] and result["status"] == "completed" and args.stop_after == "fold"
+                        and "final_corner_positions_w" in result):
+                    # BC dataset in the PR #37 format (high_level.jsonl, low_level.npz, metadata.json, context.json)
+                    try:
+                        context = fold_context(
+                            grasp_mode=args.grasp_mode, corner_vertex_indices=result["corner_vertex_ids"],
+                            pairs=pairs, sample_dt=base.physics_dt, success_threshold_m=args.success_distance,
+                            final_pair_distances_m=result["final_distances_m"], config=vars(args))
+                        saved = episode_log.save(run_dir, pairs, args.success_distance,
+                                                 result["final_corner_positions_w"], run_dir.name, context)
+                        print(f"[fold] BC dataset {'saved' if saved else 'NOT saved'}: {run_dir} "
+                              f"({len(episode_log.segments)} pick/place, {len(episode_log.rows)} steps)", flush=True)
+                    except Exception as exc:  # never lose the run because of the export
+                        print(f"[fold] BC dataset export failed: {type(exc).__name__}: {exc}", flush=True)
             if video_dir is not None and result["success"]:
                 clips = list(video_dir.glob("*.mp4"))
                 if not clips or not all(clip.stat().st_size > 0 for clip in clips):

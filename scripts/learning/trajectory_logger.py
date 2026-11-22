@@ -8,11 +8,6 @@ class TrajectoryLogger:
         # 데이터를 저장할 파일 경로
         self.filepath = Path(filepath)
 
-        # 저장 폴더가 없으면 자동 생성
-        self.filepath.parent.mkdir(
-            parents=True, exist_ok=True
-        )
-
         # 시연 기록을 임시로 보관할 리스트
         self.records = []
 
@@ -38,7 +33,10 @@ class TrajectoryLogger:
         self.records.append(record)
 
     def save(self):
-        # 기록한 데이터를 JSONL 파일로 저장
+        self.filepath.parent.mkdir(
+            parents=True, exist_ok=True
+        )
+
         with self.filepath.open(
             "w", encoding="utf-8"
         ) as f:
