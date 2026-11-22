@@ -28,7 +28,8 @@ from isaaclab.app import add_launcher_args, launch_simulation
 from isaaclab.visualizers import VisualizerCfg
 from isaaclab.managers import EventTermCfg
 from isaaclab.utils.math import subtract_frame_transforms
-from isaaclab_tasks.utils import resolve_task_config, setup_preset_cli
+from isaaclab_tasks.utils import setup_preset_cli
+from task_config_compat import resolve_cloth_task_config
 import isaaclab.sim as sim_utils
 import isaaclab_tasks  # noqa: F401
 
@@ -50,6 +51,14 @@ class GraspOutcome(Exception):
     def __init__(self, outcome, phase):
         super().__init__(f"{outcome} during {phase}")
         self.outcome = outcome
+        self.phase = phase
+
+
+class CorrectionNotNeeded(Exception):
+    """The released cloth settled into a successful fold while a correction was approaching."""
+
+    def __init__(self, phase):
+        super().__init__(phase)
         self.phase = phase
 
 
@@ -89,6 +98,22 @@ def main():
     parser.add_argument("--open_width", type=float, default=0.04, help="Finger gap before closing [m]")
     parser.add_argument("--pad_half", type=float, default=0.01, help="Half width of a finger pad [m] (estimate)")
     parser.add_argument("--edge_margin", type=float, default=0.005, help="Clearance between a pad and the cloth edge [m]")
+    parser.add_argument("--close_lift", type=float, default=0.0,
+                        help="Physical: raise the TCP this much above where the descent stopped before closing [m]")
+    parser.add_argument("--arc_peak", type=float, default=None,
+                        help="Carry along a parabola from the grasp-check height; peak = this much above the corner start [m]")
+    parser.add_argument("--release_height", type=float, default=None,
+                        help="Physical: open the fingers with the TCP this high above the table [m]")
+    parser.add_argument("--move_axis", choices=["auto", "x", "y"], default="auto",
+                        help="auto = edge nearest the robot (old); x/y = move corners along this world axis")
+    parser.add_argument("--place_inset", type=float, default=0.0,
+                        help="Physical mirror place: pull the place point back toward the fold line by this much [m]")
+    parser.add_argument("--free_speed", type=float, default=1.0,
+                        help="Speed-up factor for moves while no cloth is held (2 = twice as fast)")
+    parser.add_argument("--retry_in_place", action="store_true",
+                        help="After a failed grasp check, open and re-grasp from where the hand is (no raise)")
+    parser.add_argument("--place_settle_s", type=float, default=None,
+                        help="Wait after each placement before the next corner [s] (None = --settle_seconds)")
     parser.add_argument("--press_depth", type=float, default=0.0, help="TCP target below the cloth surface when closing [m]")
     parser.add_argument("--finger_friction", type=float, default=1.5, help="Finger dynamic friction, max combine")
     parser.add_argument("--finger_static_friction", type=float, default=2.0, help="Finger static friction, max combine")
@@ -170,7 +195,7 @@ def main():
     args.start_x = args.cloth_x + rng.uniform(-args.pos_jitter, args.pos_jitter)
     args.start_y = args.cloth_y + rng.uniform(-args.pos_jitter, args.pos_jitter)
     sys.argv = [sys.argv[0], *hydra_args]
-    cfg, _ = resolve_task_config("Isaac-Lift-Cloth-Franka", "")
+    cfg, _ = resolve_cloth_task_config("Isaac-Lift-Cloth-Franka", "")
     material = cfg.scene.deformable.spawn.physics_material
     original_bend = material.surface_bend_stiffness
     material.surface_bend_stiffness = args.bend_stiffness
@@ -355,6 +380,13 @@ def main():
                     # Pre-step-only writes are undone by the stiff cloth solver.
                     picker.update(dt=base.physics_dt)
                 step_index += 1
+                # Correction approach: stop if the cloth already folded itself (all pairs in tolerance)
+                if (phase.startswith("correction_") and pairs is not None and picker is not None
+                        and not picker.is_grasping and step_index % 8 == 0):
+                    folded = all(d <= args.success_distance for d in pair_distances(corners(), pairs))
+                    transport["ok_streak"] = transport.get("ok_streak", 0) + 1 if folded else 0
+                    if transport["ok_streak"] >= 4:
+                        raise CorrectionNotNeeded(phase)
                 # Physical grasp: watch the carried corner (corrections use a deliberately low arc)
                 if (args.grasp_mode == "physical" and picker.is_grasping and "fold_arc" in phase
                         and not phase.startswith("correction")):
@@ -364,8 +396,10 @@ def main():
                         transport["slip_phase"] = phase
                     # Dropped: the corner lies on the table while the hand is still well above it
                     # (at the end of the arc both come down together, which is not a drop)
-                    if (float(picker.target_position_w[2]) - table_top_z < args.drop_height
-                            and float(anchor()[2]) - table_top_z > args.drop_hand_height):
+                    held_z = (float(as_tensor(cloth.data.nodal_pos_w)[0, transport["pinch_vertex"], 2])
+                              if "pinch_vertex" in transport else float(picker.target_position_w[2]))
+                    hand_limit = transport.get("hand_ref_z", table_top_z + args.drop_hand_height)
+                    if held_z - table_top_z < args.drop_height and float(anchor()[2]) > hand_limit:
                         raise GraspOutcome("dropped", phase)
                 if corner_indices is not None and step_index % 4 == 0:
                     rows.append((step_index * base.physics_dt, phase,
@@ -397,6 +431,8 @@ def main():
 
             def move(goal_w, count=240, goal_quat_w=None, strict=True):
                 nonlocal target_w, target_quat_w
+                if picker is not None and not picker.is_grasping and args.free_speed > 0:
+                    count = max(1, round(count / args.free_speed))  # nothing held: move faster
                 start = target_w.clone()
                 start_quat = target_quat_w.clone()
                 goal_quat = target_quat_w.clone() if goal_quat_w is None else goal_quat_w.clone()
@@ -437,17 +473,25 @@ def main():
                 phase = f"{number}_grasp_check"
                 # Let the squeeze settle before lifting (the close command itself already took 1 s)
                 hold(math.ceil(args.grasp_settle_s / base.physics_dt))
-                start_z = float(corners()[source][2])
+                # Physical: judge the pinched vertex (about 4 cm inside the corner); the corner tip sags
+                probe = ((lambda: as_tensor(cloth.data.nodal_pos_w)[0, pinch_vertices[source]]) if physical
+                         else (lambda: corners()[source]))
+                start_z = float(probe()[2])
+                corner_start_z = float(corners()[source][2])
                 lift = anchor().clone()
                 lift[2] += args.check_lift
                 # Slow lift: smoothstep over check_lift_s, peak speed = 1.5 * check_lift / check_lift_s
                 move(lift, max(1, math.ceil(args.check_lift_s / base.physics_dt)), strict=False)
                 hold(math.ceil(args.check_hold_s / base.physics_dt))
                 corner = corners()[source]
-                rise = float(corner[2]) - start_z
+                rise = float(probe()[2]) - start_z
+                if physical:
+                    transport["pinch_vertex"] = int(pinch_vertices[source])
+                    transport["hand_ref_z"] = float(anchor()[2])
+                corner_rise = float(corner[2]) - corner_start_z
                 corner_tcp = float(torch.linalg.vector_norm(corner - anchor()))
                 ok = rise >= args.check_min_rise and (args.quality_max <= 0 or corner_tcp <= args.quality_max)
-                return {"rise_m": rise, "corner_tcp_m": corner_tcp, "ok": ok}
+                return {"rise_m": rise, "corner_rise_m": corner_rise, "corner_tcp_m": corner_tcp, "ok": ok}
 
             def place_corner(source, destination, number, correction=False):
                 nonlocal phase
@@ -462,8 +506,9 @@ def main():
                     # Raise vertically before moving across the cloth.
                     safe = anchor().clone()
                     safe[2] = max(float(safe[2]), float(above[2]))
-                    move(safe, 120)
-                    move(above, goal_quat_w=grasp_quat)
+                    if attempt == 0 or not args.retry_in_place:
+                        move(safe, 120)
+                        move(above, goal_quat_w=grasp_quat)
                     # Gap in free air, to tell "never opened fully" from "squeezed while descending"
                     record["open_gap_above_m"] = float(as_tensor(robot.data.joint_pos)[0, finger_ids].sum())
                     if len(finger_body_ids) == 2:
@@ -484,6 +529,12 @@ def main():
                     if physical:
                         # Physical descent is not strict: record where the hand really stopped vs the target
                         record["descend_error_mm"] = [round(float(v) * 1000, 1) for v in anchor() - touch]
+                    if physical and args.close_lift > 0:
+                        # Fingertips pressed on the table cannot close; lift off first
+                        lifted = anchor().clone()
+                        lifted[2] += args.close_lift
+                        move(lifted, 60, strict=False)
+                        record["close_lift_mm"] = round(args.close_lift * 1000, 1)
                     phase = f"{number}_grasp"
                     record["open_gap_m"] = float(as_tensor(robot.data.joint_pos)[0, finger_ids].sum())
                     set_gripper(closed=True)
@@ -506,9 +557,10 @@ def main():
                         break
                     picker.release()
                     set_gripper(closed=False)
-                    retreat = anchor().clone()
-                    retreat[2] += 0.05
-                    move(retreat, 120, strict=False)
+                    if not args.retry_in_place:
+                        retreat = anchor().clone()
+                        retreat[2] += 0.05
+                        move(retreat, 120, strict=False)
                 else:
                     raise GraspOutcome("grasp_failed", phase)
                 if args.stop_after == "grasp":
@@ -524,12 +576,16 @@ def main():
                 # mirrored by the fold), so the held corner lands on the destination instead of overshooting it.
                 mirror = physical and args.place_mode == "mirror"
                 tcp_start_xy = anchor()[:2].clone()
+                # Unit vector source -> destination; the place point is pulled back along it (toward the fold line)
+                place_dir = corners()[destination, :2] - start_node[:2]
+                place_dir = place_dir / torch.linalg.vector_norm(place_dir).clamp_min(1e-6)
+                place_shift = -args.place_inset * place_dir
                 # The grasp check already lifted the corner by rise_m. Build the arc from the height the
                 # corner had before that lift, so the check is only a prefix of the carry and the arc is
                 # not stacked on top of it (same path as a run without the check).
                 arc_start = start_node.clone()
                 if physical and not args.stack_check_lift:
-                    arc_start[2] -= record.get("rise_m", 0.0)
+                    arc_start[2] -= record.get("corner_rise_m", record.get("rise_m", 0.0))
                 initial_span = float(torch.linalg.vector_norm(corners()[destination, :2] - start_node[:2]))
                 arc_height = (max(0.008, min(args.lift_height, initial_span / 2)) if correction
                                   else max(args.lift_height, initial_span / 2))
@@ -541,10 +597,19 @@ def main():
                     alpha = (1 - math.cos(math.pi * t)) / 2
                     destination_now = corners()[destination].clone()
                     node_goal = torch.lerp(arc_start, destination_now, alpha)
-                    node_goal[2] += arc_height * math.sin(math.pi * t) + max(0.003, args.cloth_thickness + 0.001) * alpha
+                    if args.arc_peak is not None and not correction:
+                        # Parabola: starts where the grasp check left the corner, peaks at arc_peak
+                        # above the pre-lift height, ends just above the destination corner.
+                        z0 = float(start_node[2])
+                        z1 = (table_top_z + args.release_height + float(offset[2]) if args.release_height is not None
+                              else float(destination_now[2]) + max(0.003, args.cloth_thickness + 0.001))
+                        bump = max(0.0, float(arc_start[2]) + args.arc_peak - (z0 + z1) / 2)
+                        node_goal[2] = z0 + (z1 - z0) * alpha + 4 * bump * t * (1 - t)
+                    else:
+                        node_goal[2] += arc_height * math.sin(math.pi * t) + max(0.003, args.cloth_thickness + 0.001) * alpha
                     goal = node_goal - offset
                     if mirror:
-                        goal[:2] = torch.lerp(tcp_start_xy, grasp_target(destination)[:2], alpha)
+                        goal[:2] = torch.lerp(tcp_start_xy, grasp_target(destination)[:2] + place_shift, alpha)
                     move(goal, 60 if correction else 120)
                 phase = f"{number}_lower"
                 for _ in range(3):
@@ -552,8 +617,10 @@ def main():
                         offset = picker.target_position_w - anchor()
                     goal = corners()[destination].clone() - offset
                     goal[2] += max(0.003, args.cloth_thickness + 0.001)
+                    if args.release_height is not None:
+                        goal[2] = table_top_z + args.release_height  # open at this TCP height
                     if mirror:
-                        goal[:2] = grasp_target(destination)[:2]
+                        goal[:2] = grasp_target(destination)[:2] + place_shift
                     # Physical: fingers collide with the cloth layers under them, so the TCP cannot
                     # reach this height. Go as low as possible; success is judged by the corner
                     # distance after release, not by the TCP height.
@@ -575,7 +642,8 @@ def main():
                 retreat = anchor().clone()
                 retreat[2] += 0.10
                 move(retreat, 180)
-                hold(math.ceil(args.settle_seconds / base.physics_dt))
+                wait_s = args.settle_seconds if args.place_settle_s is None else args.place_settle_s
+                hold(max(1, math.ceil(wait_s / base.physics_dt)))
                 record["err_settled_mm"] = placed_error_mm()
                 print(f"[fold] placement {number} corner error mm (x,y): before open={record['err_before_open_mm']}, "
                       f"after open={record['err_after_open_mm']}, settled={record['err_settled_mm']}", flush=True)
@@ -586,6 +654,15 @@ def main():
                 hold(120)
                 corner_indices = detect_corner_vertex_indices(as_tensor(cloth.data.nodal_pos_w)[0])
                 pairs = rectangular_pairs(corners(), as_tensor(robot.data.root_pos_w)[0, :2])
+                if args.move_axis != "auto":
+                    c = corners()[:, :2]
+                    center = c.mean(0)
+                    axis = 0 if args.move_axis == "x" else 1
+                    side = 1.0 if float(as_tensor(robot.data.root_pos_w)[0, axis] - center[axis]) >= 0 else -1.0
+                    order = sorted(range(4), key=lambda i: -side * float(c[i, axis] - center[axis]))
+                    dests = order[2:]
+                    pairs = [(src, min(dests, key=lambda d: abs(float(c[d, 1 - axis] - c[src, 1 - axis]))))
+                             for src in order[:2]]
                 initial_center_xy = corners()[:, :2].mean(dim=0).clone()
                 result["initial_center_xy"] = initial_center_xy.tolist()
                 if physical:
@@ -633,7 +710,17 @@ def main():
                         break
                     worst = max(range(len(pairs)), key=distances.__getitem__)
                     print(f"[fold] correction {correction + 1}: pair={worst}, error={distances[worst]:.4f} m", flush=True)
-                    place_corner(*pairs[worst], number=f"correction_{correction + 1}", correction=True)
+                    transport["ok_streak"] = 0
+                    try:
+                        place_corner(*pairs[worst], number=f"correction_{correction + 1}", correction=True)
+                    except CorrectionNotNeeded as stop:
+                        phase = "correction_stopped"
+                        result["correction_skipped_phase"] = stop.phase
+                        print(f"[fold] cloth already folded during {stop.phase}; stopping the correction", flush=True)
+                        up = anchor().clone()
+                        up[2] += 0.08
+                        move(up, 120, strict=False)
+                        break
                     result["correction_count"] += 1
                 phase = "evaluation"
                 hold(math.ceil(args.settle_seconds / base.physics_dt))
