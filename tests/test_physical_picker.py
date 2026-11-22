@@ -29,6 +29,14 @@ class GraspPointTest(unittest.TestCase):
         xy = physical_grasp_xy(torch.tensor([0.0, 0.0]), torch.tensor([0.15, 0.15]), 0.04)
         self.assertTrue(torch.allclose(xy, torch.tensor([0.015, 0.035])))
 
+
+    def test_jaw_shift_moves_only_the_jaw_axis_toward_the_corner(self):
+        base = physical_grasp_xy(torch.tensor([0.0, 0.0]), torch.tensor([0.15, 0.15]), 0.04)
+        shifted = physical_grasp_xy(torch.tensor([0.0, 0.0]), torch.tensor([0.15, 0.15]), 0.04, jaw_shift=0.01)
+        self.assertAlmostEqual(float(shifted[0]), float(base[0]))           # x (pad room) unchanged
+        self.assertAlmostEqual(float(base[1] - shifted[1]), 0.01, places=6)  # y (jaw axis) 1 cm closer
+        with self.assertRaises(ValueError):
+            physical_grasp_xy(torch.tensor([0.0, 0.0]), torch.tensor([0.15, 0.15]), 0.04, jaw_shift=0.05)
     def test_jaw_along_x_swaps_the_room(self):
         # Jaw along the fold direction (world x): x = 20 + 15 = 35 mm, y = pad 15 mm
         xy = physical_grasp_xy(torch.tensor([0.0, 0.0]), torch.tensor([0.15, 0.15]), 0.04, jaw_axis="x")

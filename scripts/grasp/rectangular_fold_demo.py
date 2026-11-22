@@ -108,6 +108,9 @@ def main():
     parser.add_argument("--open_width", type=float, default=0.04, help="Finger gap before closing [m]")
     parser.add_argument("--pad_half", type=float, default=0.01, help="Half width of a finger pad [m] (estimate)")
     parser.add_argument("--edge_margin", type=float, default=0.005, help="Clearance between a pad and the cloth edge [m]")
+    parser.add_argument("--pinch_jaw_shift", type=float, default=0.0,
+                        help="Physical: move the pinch point this much toward the corner along the jaw axis only "
+                             "(world y at grasp_yaw_deg 0) [m]. 0 = both open fingertips land on the cloth")
     parser.add_argument("--close_lift", type=float, default=0.0,
                         help="Physical: raise the TCP this much above where the descent stopped before closing [m]")
     parser.add_argument("--arc_peak", type=float, default=None,
@@ -292,7 +295,7 @@ def main():
                "finger_static_friction": args.finger_static_friction if args.grasp_mode == "physical" else None,
                "stack_check_lift": args.stack_check_lift,
                "hand_yaw_deg": args.hand_yaw_deg, "jaw_axis": args.jaw_axis, "place_mode": args.place_mode,
-               "grasp_settle_s": args.grasp_settle_s, "check_lift_s": args.check_lift_s,
+               "grasp_settle_s": args.grasp_settle_s, "pinch_jaw_shift": args.pinch_jaw_shift, "check_lift_s": args.check_lift_s,
                "open_command": cfg.actions.gripper_action.open_command_expr}
     result = {"success": False, "status": "running", "threshold_m": args.success_distance, "applied": applied,
               "grasp_mode": args.grasp_mode, "stop_after": args.stop_after,
@@ -709,7 +712,7 @@ def main():
                     flat_nodes = as_tensor(cloth.data.nodal_pos_w)[0].clone()
                     pinch_vertices = [pinch_vertex(flat_nodes[:, :2], int(v), initial_center_xy, args.open_width,
                                                    pad_half=args.pad_half, edge_margin=args.edge_margin,
-                                                   jaw_axis=args.jaw_axis) for v in corner_indices.tolist()]
+                                                   jaw_axis=args.jaw_axis, jaw_shift=args.pinch_jaw_shift) for v in corner_indices.tolist()]
                     result["pinch_vertices"] = pinch_vertices
                     # Achieved offset from each corner (mesh spacing limits how exact it is)
                     result["pinch_offsets_mm"] = [
