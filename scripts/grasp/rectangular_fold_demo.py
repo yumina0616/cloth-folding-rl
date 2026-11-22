@@ -112,6 +112,8 @@ def main():
                         help="Speed-up factor for moves while no cloth is held (2 = twice as fast)")
     parser.add_argument("--retry_in_place", action="store_true",
                         help="After a failed grasp check, open and re-grasp from where the hand is (no raise)")
+    parser.add_argument("--approach_order", choices=["direct", "yx"], default="direct",
+                        help="Free move to above the grasp point: direct = one straight line (old), yx = world y first, then x")
     parser.add_argument("--place_settle_s", type=float, default=None,
                         help="Wait after each placement before the next corner [s] (None = --settle_seconds)")
     parser.add_argument("--press_depth", type=float, default=0.0, help="TCP target below the cloth surface when closing [m]")
@@ -293,28 +295,30 @@ def main():
     pinch_vertices = None     # per corner: the cloth vertex to pinch (physical grasp), chosen on the flat cloth
     video_dir = None
     if args.video:
-        from isaaclab.envs.utils.video_recorder_cfg import VideoRecorderCfg
-        from isaaclab_visualizers.kit import KitVisualizerCfg
-
-        # Capture at about 30 Hz, preserving simulation time during playback.
-        stride = max(1, round(1.0 / (30 * cfg.sim.dt)))
-        fps = max(1, round(1.0 / (stride * cfg.sim.dt)))
+        # Only the launch options here: Isaac Lab 3.0 refuses isaaclab_visualizers imports
+        # before SimulationApp exists, so the recorder config is built after launch (below).
         video_dir = run_dir
         args.enable_cameras = True
         args.visualizer = ["kit"]
-        cfg.sim.visualizer_cfgs = [KitVisualizerCfg(
-            eye=cfg.viewer.eye, lookat=cfg.viewer.lookat,
-            window_width=640, window_height=480,
-        )]
-        cfg.video_recorders = [VideoRecorderCfg(
-            source="visualizer:kit", output_dir=str(video_dir),
-            output_filename_prefix="rectangular_fold", fps=fps, frame_stride=stride,
-            video_length=sys.maxsize,
-        )]
-        # Store metrics alongside each recording so repeat runs remain comparable.
-        print(f"[A_single_point] Recording {fps} FPS video to {video_dir}", flush=True)
 
     with launch_simulation(cfg, args):
+        if args.video:
+            from isaaclab.envs.utils.video_recorder_cfg import VideoRecorderCfg
+            from isaaclab_visualizers.kit import KitVisualizerCfg
+
+            # Capture at about 30 Hz, preserving simulation time during playback.
+            stride = max(1, round(1.0 / (30 * cfg.sim.dt)))
+            fps = max(1, round(1.0 / (stride * cfg.sim.dt)))
+            cfg.sim.visualizer_cfgs = [KitVisualizerCfg(
+                eye=cfg.viewer.eye, lookat=cfg.viewer.lookat,
+                window_width=640, window_height=480,
+            )]
+            cfg.video_recorders = [VideoRecorderCfg(
+                source="visualizer:kit", output_dir=str(video_dir),
+                output_filename_prefix="rectangular_fold", fps=fps, frame_stride=stride,
+                video_length=sys.maxsize,
+            )]
+            print(f"[A_single_point] Recording {fps} FPS video to {video_dir}", flush=True)
         env = gym.make("Isaac-Lift-Cloth-Franka", cfg=cfg)
         gate_video_recorders(env, lambda: args.save_all_videos
                              or (result["status"] == "completed" and result["success"]))
@@ -381,7 +385,9 @@ def main():
                     picker.update(dt=base.physics_dt)
                 step_index += 1
                 # Correction approach: stop if the cloth already folded itself (all pairs in tolerance)
-                if (phase.startswith("correction_") and pairs is not None and picker is not None
+                # Only while the hand is still on its way (approach/descend), never once the fingers close
+                if (phase.startswith("correction_") and phase.endswith(("_approach", "_descend"))
+                        and pairs is not None and picker is not None
                         and not picker.is_grasping and step_index % 8 == 0):
                     folded = all(d <= args.success_distance for d in pair_distances(corners(), pairs))
                     transport["ok_streak"] = transport.get("ok_streak", 0) + 1 if folded else 0
@@ -508,7 +514,14 @@ def main():
                     safe[2] = max(float(safe[2]), float(above[2]))
                     if attempt == 0 or not args.retry_in_place:
                         move(safe, 120)
-                        move(above, goal_quat_w=grasp_quat)
+                        if args.approach_order == "yx":
+                            # Sideways (world y, as the robot sees it) first at the safe height, then x
+                            via = safe.clone()
+                            via[1] = above[1]
+                            move(via, 120, goal_quat_w=grasp_quat)
+                            move(above, 120)
+                        else:
+                            move(above, goal_quat_w=grasp_quat)
                     # Gap in free air, to tell "never opened fully" from "squeezed while descending"
                     record["open_gap_above_m"] = float(as_tensor(robot.data.joint_pos)[0, finger_ids].sum())
                     if len(finger_body_ids) == 2:
@@ -716,6 +729,10 @@ def main():
                     except CorrectionNotNeeded as stop:
                         phase = "correction_stopped"
                         result["correction_skipped_phase"] = stop.phase
+                        if picker.is_grasping:
+                            picker.release()
+                        if float(action[0, 7]) < 0:
+                            set_gripper(closed=False)  # never lift the cloth while stopping
                         print(f"[fold] cloth already folded during {stop.phase}; stopping the correction", flush=True)
                         up = anchor().clone()
                         up[2] += 0.08
@@ -742,6 +759,18 @@ def main():
             try:
                 env.close()
             finally:
+                # Put the outcome in the folder name: ok / fail / dropped / grasp_failed / error
+                tag = ("ok" if result["success"] else
+                       "fail" if result["status"] == "completed" else result["status"])
+                tagged = run_dir.with_name(f"{run_dir.name}_{tag}")
+                try:
+                    run_dir.rename(tagged)
+                    run_dir = tagged
+                    if video_dir is not None:
+                        video_dir = tagged
+                except OSError as exc:
+                    print(f"[fold] could not rename the run folder: {exc}", flush=True)
+                result["run_tag"] = tag
                 (run_dir / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
                 nodes = result.get("mesh_node_count") or 0
                 summary = {
@@ -780,6 +809,10 @@ def main():
                     print(f"[A_single_point] Video saved: {clip}", flush=True)
             elif video_dir is not None:
                 print("[fold] Unsuccessful trial: video frames discarded without saving MP4.", flush=True)
+            if video_dir is not None:
+                # Same tag at the front of the video name, so a copied MP4 still says how the run ended
+                for clip in video_dir.glob("rectangular_fold_*.mp4"):
+                    clip.rename(clip.with_name(f"{result.get('run_tag', 'unknown')}_{clip.name}"))
 
 
 if __name__ == "__main__":
