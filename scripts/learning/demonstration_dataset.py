@@ -7,6 +7,9 @@ Low-level actions are RAW here: train_bc.py must normalize them with saved bound
 A recorded row is written AFTER its action was executed. Consequently the low-level
 supervised sample uses observation at row t-1 and command from row t, never the
 post-action observation at row t as the input for command t.
+
+Correction pick/place records are accepted as additional high-level samples. Their
+low-level pair index is read from the recorded pair_index rather than the record order.
 """
 from __future__ import annotations
 
@@ -78,8 +81,26 @@ def _check_log(log):
     return phase, action, corners, tcp, grasping
 
 
+def _record_pair_index(record, order, pair_count):
+    """Resolve the goal pair, allowing legacy two-pick data without pair_index.
+
+    Corrections may revisit either pair, so their record order cannot be used
+    to infer the target pair. They must carry an explicit pair_index.
+    """
+    if "pair_index" in record:
+        pair_index = record["pair_index"]
+    elif order < pair_count:
+        pair_index = order
+    else:
+        raise ValueError("Correction record is missing pair_index")
+
+    if type(pair_index) is not int or not 0 <= pair_index < pair_count:
+        raise ValueError(f"pair_index must be an integer from 0 to {pair_count - 1}")
+    return pair_index
+
+
 def load_episode(directory):
-    """Read one successful episode, preserving its high- and low-level samples."""
+    """Read one successful episode, including valid correction pick/place samples."""
     folder = Path(directory)
     context = _read_json(folder, "context.json")
     metadata = _read_json(folder, "metadata.json")
@@ -99,14 +120,13 @@ def load_episode(directory):
         encoding="utf-8").splitlines() if line.strip()]
     if not records:
         raise ValueError("Episode has no high-level transitions")
-    if len(records) > 2:
-        raise ValueError("Current two-pair policy supports at most two pick/place transitions")
 
     high_obs, high_actions, low_obs, low_actions = [], [], [], []
     with np.load(folder / "low_level.npz", allow_pickle=False) as log:
         phases, commands, corners, tcp, grasping = _check_log(log)
         last_end = 0
-        for pair_index, record in enumerate(records):
+        for order, record in enumerate(records):
+            pair_index = _record_pair_index(record, order, len(pairs))
             start, end = record["low_level_start"], record["low_level_end"]
             if (type(start) is not int or type(end) is not int
                     or not (0 <= last_end <= start < end <= len(commands))):
