@@ -1,4 +1,4 @@
-"""Sequential rectangular cloth fold with one virtual gripper.
+﻿"""Sequential rectangular cloth fold with one virtual gripper.
 
 Run with the Isaac Lab launcher; see README_rectangular_fold.md.
 """
@@ -44,6 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from fold_dataset_export import FoldEpisodeLog, fold_context
 from cloth_corner_tracker import detect_corner_vertex_indices, get_corner_world_positions
 from rectangular_fold_geometry import rectangular_pairs, pair_distances
+from scripts.metrics.fold_shape_metric import fold_shape_success
 from successful_video import gate_video_recorders
 from towel_visual import TowelVisual
 
@@ -72,6 +73,12 @@ def main():
     parser.add_argument("--lift_height", type=float, default=0.12)
     parser.add_argument("--settle_seconds", type=float, default=3.0)
     parser.add_argument("--success_distance", type=float, default=0.02)
+    parser.add_argument(
+        "--shape_iou_threshold",
+        type=float,
+        default=0.0,
+        help="Minimum IoU for successful fold shape (0 = record only)",
+    )
     parser.add_argument("--cloth_x", type=float, default=0.50)
     parser.add_argument("--cloth_y", type=float, default=-0.05)
     parser.add_argument("--cloth_yaw_deg", type=float, default=0.0)
@@ -170,6 +177,8 @@ def main():
                  "cloth_thickness", "cloth_density"):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             parser.error(f"{name} must be positive and finite")
+    if not math.isfinite(args.shape_iou_threshold) or not 0 <= args.shape_iou_threshold <= 1:
+        parser.error("--shape_iou_threshold must be between 0 and 1")
     if args.mesh_refinement < 1:
         parser.error("mesh_refinement must be at least 1")
     if not all(math.isfinite(v) for v in (args.cloth_x, args.cloth_y, args.cloth_yaw_deg)):
@@ -693,6 +702,7 @@ def main():
                     dests = order[2:]
                     pairs = [(src, min(dests, key=lambda d: abs(float(c[d, 1 - axis] - c[src, 1 - axis]))))
                              for src in order[:2]]
+                initial_corners = corners().clone()
                 initial_center_xy = corners()[:, :2].mean(dim=0).clone()
                 result["initial_center_xy"] = initial_center_xy.tolist()
                 if physical:
@@ -720,6 +730,7 @@ def main():
                         break
                 if args.stop_after != "fold":
                     # grasp: the grasp check passed. transport: the first corner reached its goal.
+                    # Keep the original intermediate-stage evaluation unchanged.
                     phase = "evaluation"
                     hold(math.ceil(args.settle_seconds / base.physics_dt))
                     distances = pair_distances(corners(), pairs)
@@ -758,12 +769,50 @@ def main():
                     result["correction_count"] += 1
                 phase = "evaluation"
                 hold(math.ceil(args.settle_seconds / base.physics_dt))
+
+                # Keep the original CLI-configurable pair-distance criterion.
                 distances = pair_distances(corners(), pairs)
-                result.update(status="completed", final_distances_m=distances,
-                              final_corner_positions_w=corners().tolist(),
-                              final_rms_speed_m_s=float(torch.sqrt((as_tensor(cloth.data.nodal_vel_w)[0] ** 2).sum(-1).mean())),
-                              success=all(math.isfinite(d) and d <= args.success_distance for d in distances))
-                print(f"[fold] success={result['success']}, final distances={distances}", flush=True)
+                corner_ok = all(
+                    math.isfinite(d) and d <= args.success_distance for d in distances
+                )
+
+                # Keep the run result even if the optional shape metric cannot be computed.
+                # With threshold 0, IoU is recorded only and cannot reject a valid fold.
+                shape_error = None
+                try:
+                    shape_ok, shape_metrics = fold_shape_success(
+                        nodes_w=as_tensor(cloth.data.nodal_pos_w)[0],
+                        initial_corners=initial_corners,
+                        current_corners=corners(),
+                        pairs=pairs,
+                        min_iou=args.shape_iou_threshold,
+                        cloth_size=args.cloth_size,
+                    )
+                except Exception as exc:
+                    shape_error = f"{type(exc).__name__}: {exc}"
+                    shape_ok = args.shape_iou_threshold == 0.0
+                    shape_metrics = {"iou": None}
+                    print(f"[fold] IoU evaluation failed: {shape_error}", flush=True)
+                result.update(
+                    status="completed",
+                    final_distances_m=distances,
+                    final_corner_positions_w=corners().tolist(),
+                    final_rms_speed_m_s=float(torch.sqrt(
+                        (as_tensor(cloth.data.nodal_vel_w)[0] ** 2).sum(-1).mean()
+                    )),
+                    corner_success=corner_ok,
+                    shape_success=shape_ok,
+                    shape_metrics=shape_metrics,
+                    shape_error=shape_error,
+                    success=corner_ok and shape_ok,
+                )
+                print(
+                    f"[fold] success={result['success']}, corner_ok={corner_ok}, "
+                    f"IoU={shape_metrics['iou'] if shape_metrics['iou'] is not None else 'unavailable'}, "
+                    f"shape_ok={shape_ok}, "
+                    f"final distances={distances}",
+                    flush=True,
+                )
         except GraspOutcome as outcome:
             result.update(status=outcome.outcome, phase=outcome.phase, success=False)
             print(f"[fold] {outcome.outcome} during {outcome.phase}", flush=True)
