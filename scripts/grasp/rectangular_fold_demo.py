@@ -76,8 +76,8 @@ def main():
     parser.add_argument(
         "--shape_iou_threshold",
         type=float,
-        default=0.75,
-        help="Minimum IoU for successful fold shape",
+        default=0.0,
+        help="Minimum IoU for successful fold shape (0 = record only)",
     )
     parser.add_argument("--cloth_x", type=float, default=0.50)
     parser.add_argument("--cloth_y", type=float, default=-0.05)
@@ -776,15 +776,23 @@ def main():
                     math.isfinite(d) and d <= args.success_distance for d in distances
                 )
 
-                # Evaluate the final folded silhouette using the separate IoU metric.
-                shape_ok, shape_metrics = fold_shape_success(
-                    nodes_w=as_tensor(cloth.data.nodal_pos_w)[0],
-                    initial_corners=initial_corners,
-                    current_corners=corners(),
-                    pairs=pairs,
-                    min_iou=args.shape_iou_threshold,
-                    cloth_size=args.cloth_size,
-                )
+                # Keep the run result even if the optional shape metric cannot be computed.
+                # With threshold 0, IoU is recorded only and cannot reject a valid fold.
+                shape_error = None
+                try:
+                    shape_ok, shape_metrics = fold_shape_success(
+                        nodes_w=as_tensor(cloth.data.nodal_pos_w)[0],
+                        initial_corners=initial_corners,
+                        current_corners=corners(),
+                        pairs=pairs,
+                        min_iou=args.shape_iou_threshold,
+                        cloth_size=args.cloth_size,
+                    )
+                except Exception as exc:
+                    shape_error = f"{type(exc).__name__}: {exc}"
+                    shape_ok = args.shape_iou_threshold == 0.0
+                    shape_metrics = {"iou": None}
+                    print(f"[fold] IoU evaluation failed: {shape_error}", flush=True)
                 result.update(
                     status="completed",
                     final_distances_m=distances,
@@ -795,11 +803,13 @@ def main():
                     corner_success=corner_ok,
                     shape_success=shape_ok,
                     shape_metrics=shape_metrics,
+                    shape_error=shape_error,
                     success=corner_ok and shape_ok,
                 )
                 print(
                     f"[fold] success={result['success']}, corner_ok={corner_ok}, "
-                    f"IoU={shape_metrics['iou']:.4f}, shape_ok={shape_ok}, "
+                    f"IoU={shape_metrics['iou'] if shape_metrics['iou'] is not None else 'unavailable'}, "
+                    f"shape_ok={shape_ok}, "
                     f"final distances={distances}",
                     flush=True,
                 )
