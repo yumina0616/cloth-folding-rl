@@ -27,7 +27,7 @@ import torch
 from isaaclab.app import add_launcher_args, launch_simulation
 from isaaclab.visualizers import VisualizerCfg
 from isaaclab.managers import EventTermCfg
-from isaaclab.utils.math import subtract_frame_transforms
+from isaaclab.utils.math import quat_from_euler_xyz, quat_mul, subtract_frame_transforms
 from isaaclab_tasks.utils import setup_preset_cli
 from task_config_compat import resolve_cloth_task_config
 import isaaclab.sim as sim_utils
@@ -378,8 +378,17 @@ def main():
             target_w = anchor().clone()
             target_quat_w = as_tensor(ee.data.target_quat_w)[0, 0].clone()
             # Hand pose used for the approach: identity, rotated about world z (the gripper is 180 deg symmetric)
-            half_yaw_hand = math.radians(args.hand_yaw_deg) / 2
-            grasp_quat = action.new_tensor((math.cos(half_yaw_hand), 0.0, 0.0, math.sin(half_yaw_hand)))
+
+            def yaw_grasp_quat(yaw_deg):
+                # Top-down hand pose used so far, (1, 0, 0, 0), turned about WORLD z by yaw_deg.
+                # Built with Isaac Lab's own quaternion functions: a hand-written (cos, 0, 0, sin) tilted
+                # the hand instead of turning it, so the tuple order is not assumed here.
+                down = action.new_tensor((1.0, 0.0, 0.0, 0.0)).unsqueeze(0)
+                zero = action.new_zeros(1)
+                turn = quat_from_euler_xyz(zero, zero, action.new_tensor([math.radians(yaw_deg)]))
+                return quat_mul(turn, down)[0]
+
+            grasp_quat = yaw_grasp_quat(args.hand_yaw_deg)
 
             def set_pose(position_w, quaternion_w):
                 # Absolute IK actions are expressed in the robot ROOT frame,
@@ -723,8 +732,7 @@ def main():
                     # kept within +-90 deg because the gripper is 180 deg symmetric
                     hand_yaw = math.remainder(args.hand_yaw_deg + math.degrees(cloth_yaw), 180.0)
                     result["hand_yaw_used_deg"] = hand_yaw
-                    half_yaw_hand = math.radians(hand_yaw) / 2
-                    grasp_quat = action.new_tensor((math.cos(half_yaw_hand), 0.0, 0.0, math.sin(half_yaw_hand)))
+                    grasp_quat = yaw_grasp_quat(hand_yaw)
                     print(f"[fold] cloth yaw measured={math.degrees(cloth_yaw):.2f} deg "
                           f"(commanded {args.start_yaw_deg:.2f}), hand yaw={hand_yaw:.2f} deg", flush=True)
                 initial_corners = corners().clone()
