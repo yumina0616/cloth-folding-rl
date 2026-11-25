@@ -43,7 +43,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "corner_tracking"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from fold_dataset_export import FoldEpisodeLog, fold_context
 from cloth_corner_tracker import detect_corner_vertex_indices, get_corner_world_positions
-from rectangular_fold_geometry import rectangular_pairs, pair_distances
+from rectangular_fold_geometry import (axis_pairs, cloth_yaw_from_corners, rectangular_pairs, pair_distances,
+                                       to_cloth_frame)
 from scripts.metrics.fold_shape_metric import fold_shape_success
 from successful_video import gate_video_recorders
 from towel_visual import TowelVisual
@@ -81,7 +82,9 @@ def main():
     )
     parser.add_argument("--cloth_x", type=float, default=0.50)
     parser.add_argument("--cloth_y", type=float, default=-0.05)
-    parser.add_argument("--cloth_yaw_deg", type=float, default=0.0)
+    parser.add_argument("--cloth_yaw_deg", type=float, default=0.0, help="Cloth rotation about world z [deg]")
+    parser.add_argument("--yaw_jitter", type=float, default=0.0,
+                        help="Max random change of --cloth_yaw_deg [deg] (per --seed, drawn after --pos_jitter)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--cloth_size", type=float, default=0.30)
     parser.add_argument("--mesh_refinement", type=float, default=32.0)
@@ -153,8 +156,9 @@ def main():
                              "corner would be pinched (the held corner lands on it); live = destination minus the "
                              "measured corner-to-hand offset (old behaviour, kept for comparison)")
     parser.add_argument("--grasp_yaw_deg", type=float, default=0.0,
-                        help="Physical grasp only: hand rotation about world z (multiple of 90). "
-                             "0 (default, original) = jaw closes along world y, 90 = along world x (the fold direction)")
+                        help="Physical grasp only: hand rotation relative to the cloth (multiple of 90). "
+                             "0 (default, original) = jaw closes along the cloth y axis, 90 = along the cloth x axis. "
+                             "The measured cloth rotation is added on top")
     # Transport monitoring
     parser.add_argument("--slip_drift", type=float, default=0.02, help="Corner-to-TCP change counted as slip [m]")
     parser.add_argument("--drop_height", type=float, default=0.01, help="Corner below this height above the table while carried = dropped [m]")
@@ -186,8 +190,8 @@ def main():
         parser.error("mesh_refinement must be at least 1")
     if not all(math.isfinite(v) for v in (args.cloth_x, args.cloth_y, args.cloth_yaw_deg)):
         parser.error("Cloth pose must be finite")
-    if args.grasp_mode == "physical" and args.cloth_yaw_deg != 0.0:
-        parser.error("Physical grasp assumes an unrotated cloth (the jaw closes along world y)")
+    if not (math.isfinite(args.yaw_jitter) and 0 <= args.yaw_jitter < 45):
+        parser.error("yaw_jitter must be in [0, 45) deg")
     if not math.isfinite(args.grasp_yaw_deg) or args.grasp_yaw_deg % 90 != 0:
         parser.error("grasp_yaw_deg must be a multiple of 90")
     if not (math.isfinite(args.grasp_settle_s) and args.grasp_settle_s >= 0):
@@ -211,6 +215,8 @@ def main():
     rng = random.Random(args.seed)
     args.start_x = args.cloth_x + rng.uniform(-args.pos_jitter, args.pos_jitter)
     args.start_y = args.cloth_y + rng.uniform(-args.pos_jitter, args.pos_jitter)
+    # Drawn after the position, so earlier seeds keep the same position
+    args.start_yaw_deg = args.cloth_yaw_deg + (rng.uniform(-args.yaw_jitter, args.yaw_jitter) if args.yaw_jitter else 0.0)
     sys.argv = [sys.argv[0], *hydra_args]
     cfg, _ = resolve_cloth_task_config("Isaac-Lift-Cloth-Franka", "")
     material = cfg.scene.deformable.spawn.physics_material
@@ -249,7 +255,7 @@ def main():
     # The task table is a centered cuboid whose top sits at z = 0
     table_top_z = float(cfg.scene.table.init_state.pos[2]) + 1.05 / 2
     cfg.scene.deformable.init_state.pos = (args.start_x, args.start_y, 0.012)
-    half_yaw = math.radians(args.cloth_yaw_deg) / 2
+    half_yaw = math.radians(args.start_yaw_deg) / 2
     cfg.scene.deformable.init_state.rot = (math.cos(half_yaw), 0.0, 0.0, math.sin(half_yaw))
     cfg.events.reset_deformable = None
     if args.grasp_mode == "virtual":
@@ -299,7 +305,7 @@ def main():
                "open_command": cfg.actions.gripper_action.open_command_expr}
     result = {"success": False, "status": "running", "threshold_m": args.success_distance, "applied": applied,
               "grasp_mode": args.grasp_mode, "stop_after": args.stop_after,
-              "cloth_start": [args.start_x, args.start_y], "grasps": []}
+              "cloth_start": [args.start_x, args.start_y], "cloth_start_yaw_deg": args.start_yaw_deg, "grasps": []}
     transport = {"max_drift_m": 0.0, "slip_phase": None}
     rows = []
     episode_log = FoldEpisodeLog()  # every step, saved in the PR #37 BC format for successful runs
@@ -695,16 +701,22 @@ def main():
             with torch.inference_mode():
                 hold(120)
                 corner_indices = detect_corner_vertex_indices(as_tensor(cloth.data.nodal_pos_w)[0])
+                # Measured cloth rotation (edges vs world x), used as the cloth axes from here on
+                cloth_yaw = cloth_yaw_from_corners(corners()) if physical else 0.0
+                result["cloth_yaw_measured_deg"] = math.degrees(cloth_yaw)
                 pairs = rectangular_pairs(corners(), as_tensor(robot.data.root_pos_w)[0, :2])
                 if args.move_axis != "auto":
-                    c = corners()[:, :2]
-                    center = c.mean(0)
-                    axis = 0 if args.move_axis == "x" else 1
-                    side = 1.0 if float(as_tensor(robot.data.root_pos_w)[0, axis] - center[axis]) >= 0 else -1.0
-                    order = sorted(range(4), key=lambda i: -side * float(c[i, axis] - center[axis]))
-                    dests = order[2:]
-                    pairs = [(src, min(dests, key=lambda d: abs(float(c[d, 1 - axis] - c[src, 1 - axis]))))
-                             for src in order[:2]]
+                    # x / y are the cloth's own axes (the world axes when the cloth is not rotated)
+                    pairs = axis_pairs(corners(), as_tensor(robot.data.root_pos_w)[0, :2], args.move_axis, cloth_yaw)
+                if physical:
+                    # Jaw closes along the cloth axis: hand yaw = grasp_yaw_deg + cloth rotation,
+                    # kept within +-90 deg because the gripper is 180 deg symmetric
+                    hand_yaw = math.remainder(args.hand_yaw_deg + math.degrees(cloth_yaw), 180.0)
+                    result["hand_yaw_used_deg"] = hand_yaw
+                    half_yaw_hand = math.radians(hand_yaw) / 2
+                    grasp_quat = action.new_tensor((math.cos(half_yaw_hand), 0.0, 0.0, math.sin(half_yaw_hand)))
+                    print(f"[fold] cloth yaw measured={math.degrees(cloth_yaw):.2f} deg "
+                          f"(commanded {args.start_yaw_deg:.2f}), hand yaw={hand_yaw:.2f} deg", flush=True)
                 initial_corners = corners().clone()
                 initial_center_xy = corners()[:, :2].mean(dim=0).clone()
                 result["initial_center_xy"] = initial_center_xy.tolist()
@@ -712,11 +724,16 @@ def main():
                     flat_nodes = as_tensor(cloth.data.nodal_pos_w)[0].clone()
                     pinch_vertices = [pinch_vertex(flat_nodes[:, :2], int(v), initial_center_xy, args.open_width,
                                                    pad_half=args.pad_half, edge_margin=args.edge_margin,
-                                                   jaw_axis=args.jaw_axis, jaw_shift=args.pinch_jaw_shift) for v in corner_indices.tolist()]
+                                                   jaw_axis=args.jaw_axis, jaw_shift=args.pinch_jaw_shift,
+                                                   axes_yaw=cloth_yaw) for v in corner_indices.tolist()]
                     result["pinch_vertices"] = pinch_vertices
                     # Achieved offset from each corner (mesh spacing limits how exact it is)
                     result["pinch_offsets_mm"] = [
                         [round(float(d) * 1000, 1) for d in flat_nodes[p, :2] - flat_nodes[c, :2]]
+                        for p, c in zip(pinch_vertices, corner_indices.tolist())]
+                    # The same offsets along the cloth's own axes (equal to the above when it is not rotated)
+                    result["pinch_offsets_cloth_mm"] = [
+                        [round(float(d) * 1000, 1) for d in to_cloth_frame(flat_nodes[p, :2], flat_nodes[c, :2], cloth_yaw)]
                         for p, c in zip(pinch_vertices, corner_indices.tolist())]
                     print(f"[fold] pinch vertices={pinch_vertices}, offsets from corner mm={result['pinch_offsets_mm']}",
                           flush=True)

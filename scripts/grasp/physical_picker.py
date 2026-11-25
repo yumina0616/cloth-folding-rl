@@ -18,12 +18,13 @@ def as_tensor(value):
 
 
 def physical_grasp_xy(corner_xy, center_xy, open_width, *, pad_half=0.01, edge_margin=0.005, jaw_axis="y",
-                      jaw_shift=0.0):
+                      jaw_shift=0.0, axes_yaw=0.0):
     """Grasp point near a corner so that both open fingertips land on the cloth.
 
     The fingers spread only along the jaw axis (world "x" or "y"): that axis needs room
     for half the open gap plus a pad, the other axis only for the pad (008 "axis" layout).
-    Assumes the cloth edges are aligned with world x and y (no cloth rotation).
+    The cloth edges are along world x and y rotated by axes_yaw [rad] (0 = no cloth rotation);
+    jaw_axis "x"/"y" then means the cloth's own axes.
     jaw_shift moves the point toward the corner along the jaw axis only [m]; above 0 the outer
     fingertip no longer lands fully on the cloth.
     """
@@ -35,15 +36,23 @@ def physical_grasp_xy(corner_xy, center_xy, open_width, *, pad_half=0.01, edge_m
     jaw_room = open_width / 2 + pad_room - jaw_shift
     if not math.isfinite(jaw_shift) or jaw_room <= 0:
         raise ValueError("jaw_shift must be finite and leave the grasp point inside the cloth")
-    toward_center = torch.sign(center_xy - corner_xy)
+    if not math.isfinite(axes_yaw):
+        raise ValueError("axes_yaw must be finite")
+    c, s = math.cos(axes_yaw), math.sin(axes_yaw)
+    # Work in the cloth axes: rotate the corner-to-center direction by -axes_yaw
+    d = center_xy - corner_xy
+    local = torch.stack((d[0] * c + d[1] * s, -d[0] * s + d[1] * c))
+    toward_center = torch.sign(local)
     if bool((toward_center == 0).any()):
-        raise ValueError("Cloth center must differ from the corner in both x and y")
+        raise ValueError("Cloth center must differ from the corner in both cloth axes")
     room = (pad_room, jaw_room) if jaw_axis == "y" else (jaw_room, pad_room)
-    return corner_xy + toward_center * corner_xy.new_tensor(room)
+    step = toward_center * corner_xy.new_tensor(room)
+    # Back to world axes
+    return corner_xy + torch.stack((step[0] * c - step[1] * s, step[0] * s + step[1] * c))
 
 
 def pinch_vertex(flat_nodes_xy, corner_vertex, center_xy, open_width, *, pad_half=0.01, edge_margin=0.005,
-                 jaw_axis="y", jaw_shift=0.0):
+                 jaw_axis="y", jaw_shift=0.0, axes_yaw=0.0):
     """Mesh vertex to pinch for a corner, chosen once on the flat cloth.
 
     The grasp point is a piece of cloth: the vertex nearest to "the corner moved inward by the pad room"
@@ -57,7 +66,8 @@ def pinch_vertex(flat_nodes_xy, corner_vertex, center_xy, open_width, *, pad_hal
     if not 0 <= int(corner_vertex) < nodes.shape[0]:
         raise ValueError("corner_vertex is outside the cloth mesh")
     wanted = physical_grasp_xy(nodes[int(corner_vertex)], center_xy, open_width, pad_half=pad_half,
-                               edge_margin=edge_margin, jaw_axis=jaw_axis, jaw_shift=jaw_shift)
+                               edge_margin=edge_margin, jaw_axis=jaw_axis, jaw_shift=jaw_shift,
+                               axes_yaw=axes_yaw)
     return int(torch.argmin(((nodes - wanted) ** 2).sum(dim=1)))
 
 
