@@ -68,3 +68,15 @@ def axis_pairs(corners, robot_xy, axis, yaw=0.0):
     order = sorted(range(4), key=lambda i: -side * float(c[i, k]))
     dests = order[2:]
     return [(src, min(dests, key=lambda d: abs(float(c[d, 1 - k] - c[src, 1 - k])))) for src in order[:2]]
+
+
+def rotate_nodes_about_center(nodes, yaw):
+    """Rigidly rotate cloth nodes (N, 3) about world z through their xy mean; z is kept."""
+    nodes = torch.as_tensor(nodes)
+    center = nodes[:, :2].mean(0)
+    c, s = math.cos(yaw), math.sin(yaw)
+    d = nodes[:, :2] - center
+    out = nodes.clone()
+    out[:, 0] = center[0] + d[:, 0] * c - d[:, 1] * s
+    out[:, 1] = center[1] + d[:, 0] * s + d[:, 1] * c
+    return out

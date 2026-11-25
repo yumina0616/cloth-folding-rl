@@ -44,7 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from fold_dataset_export import FoldEpisodeLog, fold_context
 from cloth_corner_tracker import detect_corner_vertex_indices, get_corner_world_positions
 from rectangular_fold_geometry import (axis_pairs, cloth_yaw_from_corners, rectangular_pairs, pair_distances,
-                                       to_cloth_frame)
+                                       rotate_nodes_about_center, to_cloth_frame)
 from scripts.metrics.fold_shape_metric import fold_shape_success
 from successful_video import gate_video_recorders
 from towel_visual import TowelVisual
@@ -255,8 +255,9 @@ def main():
     # The task table is a centered cuboid whose top sits at z = 0
     table_top_z = float(cfg.scene.table.init_state.pos[2]) + 1.05 / 2
     cfg.scene.deformable.init_state.pos = (args.start_x, args.start_y, 0.012)
-    half_yaw = math.radians(args.start_yaw_deg) / 2
-    cfg.scene.deformable.init_state.rot = (math.cos(half_yaw), 0.0, 0.0, math.sin(half_yaw))
+    # Spawn unrotated: a rotated spawn left the cloth crumpled (commanded 40 deg, corner pairs 0.23-0.27 m
+    # instead of 0.30, measured yaw ~0). The settled flat cloth is rotated later by writing its nodes.
+    cfg.scene.deformable.init_state.rot = (1.0, 0.0, 0.0, 0.0)
     cfg.events.reset_deformable = None
     if args.grasp_mode == "virtual":
         # The attachment holds the cloth, so the fingers must not push it.
@@ -700,6 +701,15 @@ def main():
 
             with torch.inference_mode():
                 hold(120)
+                if args.start_yaw_deg != 0.0:
+                    # Rotate the settled flat cloth as a whole, at rest, then let it settle again
+                    rotated = rotate_nodes_about_center(as_tensor(cloth.data.nodal_pos_w)[0],
+                                                        math.radians(args.start_yaw_deg)).unsqueeze(0)
+                    for name, values in (("write_nodal_pos_to_sim", rotated.contiguous()),
+                                         ("write_nodal_velocity_to_sim", torch.zeros_like(rotated))):
+                        writer = getattr(cloth, name + "_index", None) or getattr(cloth, name)
+                        writer(values, env_ids=[0])
+                    hold(120)
                 corner_indices = detect_corner_vertex_indices(as_tensor(cloth.data.nodal_pos_w)[0])
                 # Measured cloth rotation (edges vs world x), used as the cloth axes from here on
                 cloth_yaw = cloth_yaw_from_corners(corners()) if physical else 0.0

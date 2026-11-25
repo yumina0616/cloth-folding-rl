@@ -70,5 +70,14 @@ class RotatedPinchTest(unittest.TestCase):
                 self.assertTrue(torch.allclose(local, plain - base[i, :2], atol=1e-9), (yaw_deg, i))
 
 
+class RotateNodesTest(unittest.TestCase):
+    def test_rigid_rotation_keeps_shape_and_sets_yaw(self):
+        flat = square(0.0)
+        rotated = GEOMETRY.rotate_nodes_about_center(flat, math.radians(40.0))
+        self.assertTrue(torch.allclose(rotated[:, :2].mean(0), flat[:, :2].mean(0)))
+        self.assertTrue(torch.allclose(torch.cdist(rotated, rotated), torch.cdist(flat, flat)))
+        self.assertAlmostEqual(math.degrees(GEOMETRY.cloth_yaw_from_corners(rotated)), 40.0, places=6)
+
+
 if __name__ == "__main__":
     unittest.main()
