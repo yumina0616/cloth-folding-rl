@@ -119,6 +119,8 @@ def main():
                         help="Physical: raise the TCP this much above where the descent stopped before closing [m]")
     parser.add_argument("--arc_peak", type=float, default=None,
                         help="Carry along a parabola from the grasp-check height; peak = this much above the corner start [m]")
+    parser.add_argument("--min_tcp_height", type=float, default=0.005,
+                        help="Physical carry arc: never aim the TCP lower than this above the table [m]")
     parser.add_argument("--release_height", type=float, default=None,
                         help="Physical: open the fingers with the TCP this high above the table [m]")
     parser.add_argument("--move_axis", choices=["auto", "x", "y"], default="auto",
@@ -682,7 +684,12 @@ def main():
                     goal = node_goal - offset
                     if mirror:
                         goal[:2] = torch.lerp(tcp_start_xy, grasp_target(destination)[:2] + place_shift, alpha)
-                    move(goal, 60 if correction else 120)
+                    if physical:
+                        # goal = held point - offset can fall below the table when a folded layer is re-grasped
+                        # (held point above the TCP); the fingers then stop on the table/cloth. Aim no lower than
+                        # min_tcp_height and, like the lowering phase, go as far as possible instead of aborting.
+                        goal[2] = max(float(goal[2]), table_top_z + args.min_tcp_height)
+                    move(goal, 60 if correction else 120, strict=not physical)
                 phase = f"{number}_lower"
                 for _ in range(3):
                     if physical:
