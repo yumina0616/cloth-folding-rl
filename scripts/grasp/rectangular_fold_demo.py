@@ -68,6 +68,21 @@ class CorrectionNotNeeded(Exception):
         self.phase = phase
 
 
+# (virtual / earlier default, tuned physical default). Any of them can still be set on the command line.
+TUNED_PHYSICAL_DEFAULTS = {
+    "pinch_jaw_shift": (0.0, 0.01),    # pinch point 1 cm closer to the corner along the jaw axis
+    "close_lift": (0.0, 0.002),        # lift 2 mm off the table before closing
+    "check_lift": (0.06, 0.02),        # grasp-check lift 2 cm
+    "arc_peak": (None, 0.04),          # carry parabola peak 4 cm
+    "release_height": (None, 0.04),    # open the fingers 4 cm above the table
+    "place_inset": (0.0, 0.01),        # place 1 cm toward the fold line
+    "move_axis": ("auto", "y"),        # fold along the cloth y axis
+    "free_speed": (1.0, 2.0),          # empty-hand moves twice as fast
+    "retry_in_place": (False, True),   # re-grasp where the hand is after a failed check
+    "place_settle_s": (None, 0.5),     # wait 0.5 s after each placement
+}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--grasp_mode", choices=["virtual", "physical"], default="virtual")
@@ -112,10 +127,10 @@ def main():
     parser.add_argument("--open_width", type=float, default=0.04, help="Finger gap before closing [m]")
     parser.add_argument("--pad_half", type=float, default=0.01, help="Half width of a finger pad [m] (estimate)")
     parser.add_argument("--edge_margin", type=float, default=0.005, help="Clearance between a pad and the cloth edge [m]")
-    parser.add_argument("--pinch_jaw_shift", type=float, default=0.0,
+    parser.add_argument("--pinch_jaw_shift", type=float, default=None,
                         help="Physical: move the pinch point this much toward the corner along the jaw axis only "
-                             "(world y at grasp_yaw_deg 0) [m]. 0 = both open fingertips land on the cloth")
-    parser.add_argument("--close_lift", type=float, default=0.0,
+                             "(cloth y at grasp_yaw_deg 0) [m]. 0 = both open fingertips land on the cloth  (default: see TUNED_PHYSICAL_DEFAULTS)")
+    parser.add_argument("--close_lift", type=float, default=None,
                         help="Physical: raise the TCP this much above where the descent stopped before closing [m]")
     parser.add_argument("--arc_peak", type=float, default=None,
                         help="Carry along a parabola from the grasp-check height; peak = this much above the corner start [m]")
@@ -123,14 +138,14 @@ def main():
                         help="Physical carry arc: never aim the TCP lower than this above the table [m]")
     parser.add_argument("--release_height", type=float, default=None,
                         help="Physical: open the fingers with the TCP this high above the table [m]")
-    parser.add_argument("--move_axis", choices=["auto", "x", "y"], default="auto",
-                        help="auto = edge nearest the robot (old); x/y = move corners along this world axis")
-    parser.add_argument("--place_inset", type=float, default=0.0,
+    parser.add_argument("--move_axis", choices=["auto", "x", "y"], default=None,
+                        help="auto = edge nearest the robot (old); x/y = move corners along this cloth axis  (default: see TUNED_PHYSICAL_DEFAULTS)")
+    parser.add_argument("--place_inset", type=float, default=None,
                         help="Physical mirror place: pull the place point back toward the fold line by this much [m]")
-    parser.add_argument("--free_speed", type=float, default=1.0,
+    parser.add_argument("--free_speed", type=float, default=None,
                         help="Speed-up factor for moves while no cloth is held (2 = twice as fast)")
-    parser.add_argument("--retry_in_place", action="store_true",
-                        help="After a failed grasp check, open and re-grasp from where the hand is (no raise)")
+    parser.add_argument("--retry_in_place", action=argparse.BooleanOptionalAction, default=None,
+                        help="After a failed grasp check, open and re-grasp from where the hand is (no raise); --no-retry_in_place = old raise-and-approach  (default: see TUNED_PHYSICAL_DEFAULTS)")
     parser.add_argument("--approach_order", choices=["direct", "yx"], default="direct",
                         help="Free move to above the grasp point: direct = one straight line (old), yx = world y first, then x")
     parser.add_argument("--place_settle_s", type=float, default=None,
@@ -140,7 +155,7 @@ def main():
     parser.add_argument("--finger_static_friction", type=float, default=2.0, help="Finger static friction, max combine")
     parser.add_argument("--gripper_effort", type=float, default=70.0, help="Franka hand force limit [N] (real hand: 70 N continuous)")
     # Grasp check after closing: lift a little, the corner must follow and stay close to the TCP
-    parser.add_argument("--check_lift", type=float, default=0.06, help="Lift used to check the grasp [m] (same height as #14)")
+    parser.add_argument("--check_lift", type=float, default=None, help="Lift used to check the grasp [m] (#14 used 0.06)  (default: see TUNED_PHYSICAL_DEFAULTS)")
     parser.add_argument("--check_hold_s", type=float, default=1.0, help="Hold time of the grasp check [s]")
     parser.add_argument("--grasp_settle_s", type=float, default=0.5,
                         help="Physical grasp: extra wait after the gripper has closed, before lifting [s] "
@@ -182,6 +197,11 @@ def main():
         parser.set_defaults(visualizer=["kit"])
     args, hydra_args = setup_preset_cli(parser)
     args.video = not args.no_video
+    # Options left unset get the tuned physical-fold value (2026-11 runs) with --grasp_mode physical,
+    # and the earlier value with --grasp_mode virtual, so the virtual fold behaves as before.
+    for name, (virtual_value, physical_value) in TUNED_PHYSICAL_DEFAULTS.items():
+        if getattr(args, name) is None:
+            setattr(args, name, physical_value if args.grasp_mode == "physical" else virtual_value)
     for name in ("lift_height", "settle_seconds", "success_distance", "bend_stiffness",
                  "cloth_size", "mesh_refinement", "table_length", "table_width", "youngs_modulus",
                  "cloth_thickness", "cloth_density"):
