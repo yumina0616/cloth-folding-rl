@@ -158,9 +158,6 @@ def main():
                         help="Physical grasp: where the hand goes when placing. mirror = the point where the destination "
                              "corner would be pinched (the held corner lands on it); live = destination minus the "
                              "measured corner-to-hand offset (old behaviour, kept for comparison)")
-    parser.add_argument("--correction_layer_yaw", action="store_true",
-                        help="Physical correction grasps: turn the hand to the edge direction of the layer being "
-                             "picked (measured just before the grasp) instead of the start-of-run cloth rotation")
     parser.add_argument("--grasp_yaw_deg", type=float, default=0.0,
                         help="Physical grasp only: hand rotation relative to the cloth (multiple of 90). "
                              "0 (default, original) = jaw closes along the cloth y axis, 90 = along the cloth x axis. "
@@ -548,7 +545,7 @@ def main():
                 vertex = int(corner_indices[source])
                 record = {"number": str(number), "source": int(source), "attempts": 0, "ok": False}
                 approach_quat = grasp_quat
-                if physical and correction and args.correction_layer_yaw and edge_vertices is not None:
+                if physical and correction and edge_vertices is not None:
                     # The picked corner may lie on a folded layer turned away from the start rotation:
                     # read that layer's edge direction now and turn the hand to it
                     nodes_now = as_tensor(cloth.data.nodal_pos_w)[0]
