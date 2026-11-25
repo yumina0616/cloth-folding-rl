@@ -80,3 +80,37 @@ def rotate_nodes_about_center(nodes, yaw):
     out[:, 0] = center[0] + d[:, 0] * c - d[:, 1] * s
     out[:, 1] = center[1] + d[:, 0] * s + d[:, 1] * c
     return out
+
+
+def edge_reference_vertices(flat_nodes_xy, corner_vertex, center_xy, yaw, distance=0.06):
+    """On the flat cloth: the vertices `distance` along each of the corner's two edges.
+
+    Returns (vertex along the cloth x edge, vertex along the cloth y edge). They are pieces of
+    cloth, so their later positions show which way that corner's layer is lying.
+    """
+    nodes = torch.as_tensor(flat_nodes_xy)[:, :2]
+    corner = nodes[int(corner_vertex)]
+    local = to_cloth_frame(torch.as_tensor(center_xy)[:2], corner, yaw)
+    sx, sy = (1.0 if float(v) >= 0 else -1.0 for v in local)
+    c, s = math.cos(yaw), math.sin(yaw)
+    along_x = corner + distance * sx * corner.new_tensor((c, s))
+    along_y = corner + distance * sy * corner.new_tensor((-s, c))
+    pick = lambda p: int(torch.argmin(((nodes - p) ** 2).sum(dim=1)))
+    return pick(along_x), pick(along_y)
+
+
+def layer_jaw_yaw(corner_xy, x_point_xy, y_point_xy):
+    """Hand yaw [rad] that closes a y-axis jaw across this layer's y edge, in (-pi/2, pi/2].
+
+    Uses the lines through the corner and the two edge reference points (directions mod 180 deg),
+    so a flipped (mirrored) layer gives the same answer as an unflipped one.
+    """
+    corner = torch.as_tensor(corner_xy)[:2]
+    vx = torch.as_tensor(x_point_xy)[:2] - corner
+    vy = torch.as_tensor(y_point_xy)[:2] - corner
+    from_x = math.atan2(float(vx[1]), float(vx[0]))                 # x edge line angle
+    from_y = math.atan2(float(vy[1]), float(vy[0])) - math.pi / 2   # y edge line angle - 90 deg
+    # Average the two estimates modulo 180 deg (circular mean of 2 * angle)
+    two = math.atan2(math.sin(2 * from_x) + math.sin(2 * from_y), math.cos(2 * from_x) + math.cos(2 * from_y))
+    yaw = two / 2
+    return yaw + math.pi if yaw <= -math.pi / 2 else yaw

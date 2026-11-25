@@ -79,5 +79,38 @@ class RotateNodesTest(unittest.TestCase):
         self.assertAlmostEqual(math.degrees(GEOMETRY.cloth_yaw_from_corners(rotated)), 40.0, places=6)
 
 
+def grid(yaw_deg, n=33, size=0.30, center=(0.5, -0.05)):
+    g = torch.linspace(-size / 2, size / 2, n, dtype=torch.float64)
+    X, Y = torch.meshgrid(g, g, indexing="ij")
+    flat = torch.stack((X.ravel() + center[0], Y.ravel() + center[1], torch.zeros(n * n, dtype=torch.float64)), 1)
+    return GEOMETRY.rotate_nodes_about_center(flat, math.radians(yaw_deg))
+
+
+class LayerYawTest(unittest.TestCase):
+    def test_edge_points_lie_along_the_two_edges(self):
+        for yaw_deg in (0.0, 20.0):
+            nodes = grid(yaw_deg)
+            corner = 0  # first grid node is a corner
+            yaw = math.radians(yaw_deg)
+            ex, ey = GEOMETRY.edge_reference_vertices(nodes[:, :2], corner, nodes[:, :2].mean(0), yaw)
+            lx = GEOMETRY.to_cloth_frame(nodes[ex, :2], nodes[corner, :2], yaw)
+            ly = GEOMETRY.to_cloth_frame(nodes[ey, :2], nodes[corner, :2], yaw)
+            self.assertAlmostEqual(float(lx[1]), 0.0, places=6)   # on the x edge
+            self.assertAlmostEqual(float(ly[0]), 0.0, places=6)   # on the y edge
+            self.assertAlmostEqual(abs(float(lx[0])), 0.05625, places=4)  # nearest node to 6 cm (grid 9.375 mm)
+
+    def test_hand_yaw_follows_the_layer_and_ignores_flips(self):
+        for yaw_deg in (0.0, 15.0, -30.0):
+            nodes = grid(yaw_deg)
+            yaw = math.radians(yaw_deg)
+            ex, ey = GEOMETRY.edge_reference_vertices(nodes[:, :2], 0, nodes[:, :2].mean(0), yaw)
+            got = GEOMETRY.layer_jaw_yaw(nodes[0, :2], nodes[ex, :2], nodes[ey, :2])
+            self.assertAlmostEqual(math.degrees(got), yaw_deg, places=6)
+            # Mirror the layer across its x edge (as a fold does): same jaw direction
+            mirrored_y = 2 * nodes[0, :2] - nodes[ey, :2]
+            got = GEOMETRY.layer_jaw_yaw(nodes[0, :2], nodes[ex, :2], mirrored_y)
+            self.assertAlmostEqual(math.degrees(got), yaw_deg, places=6)
+
+
 if __name__ == "__main__":
     unittest.main()

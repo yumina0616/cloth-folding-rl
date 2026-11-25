@@ -44,7 +44,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from fold_dataset_export import FoldEpisodeLog, fold_context
 from cloth_corner_tracker import detect_corner_vertex_indices, get_corner_world_positions
 from rectangular_fold_geometry import (axis_pairs, cloth_yaw_from_corners, rectangular_pairs, pair_distances,
-                                       rotate_nodes_about_center, to_cloth_frame)
+                                       edge_reference_vertices, layer_jaw_yaw, rotate_nodes_about_center,
+                                       to_cloth_frame)
 from scripts.metrics.fold_shape_metric import fold_shape_success
 from successful_video import gate_video_recorders
 from towel_visual import TowelVisual
@@ -155,6 +156,9 @@ def main():
                         help="Physical grasp: where the hand goes when placing. mirror = the point where the destination "
                              "corner would be pinched (the held corner lands on it); live = destination minus the "
                              "measured corner-to-hand offset (old behaviour, kept for comparison)")
+    parser.add_argument("--correction_layer_yaw", action="store_true",
+                        help="Physical correction grasps: turn the hand to the edge direction of the layer being "
+                             "picked (measured just before the grasp) instead of the start-of-run cloth rotation")
     parser.add_argument("--grasp_yaw_deg", type=float, default=0.0,
                         help="Physical grasp only: hand rotation relative to the cloth (multiple of 90). "
                              "0 (default, original) = jaw closes along the cloth y axis, 90 = along the cloth x axis. "
@@ -316,6 +320,7 @@ def main():
     pairs = None
     initial_center_xy = None  # centre of the four corners while the cloth is still flat
     pinch_vertices = None     # per corner: the cloth vertex to pinch (physical grasp), chosen on the flat cloth
+    edge_vertices = None      # per corner: (vertex along the x edge, vertex along the y edge) on the flat cloth
     video_dir = None
     if args.video:
         # Only the launch options here: Isaac Lab 3.0 refuses isaaclab_visualizers imports
@@ -540,6 +545,18 @@ def main():
                 nonlocal phase
                 vertex = int(corner_indices[source])
                 record = {"number": str(number), "source": int(source), "attempts": 0, "ok": False}
+                approach_quat = grasp_quat
+                if physical and correction and args.correction_layer_yaw and edge_vertices is not None:
+                    # The picked corner may lie on a folded layer turned away from the start rotation:
+                    # read that layer's edge direction now and turn the hand to it
+                    nodes_now = as_tensor(cloth.data.nodal_pos_w)[0]
+                    ex, ey = edge_vertices[source]
+                    layer = layer_jaw_yaw(nodes_now[int(corner_indices[source]), :2], nodes_now[ex, :2], nodes_now[ey, :2])
+                    hand = math.remainder(args.hand_yaw_deg + math.degrees(layer), 180.0)
+                    approach_quat = yaw_grasp_quat(hand)
+                    record.update(layer_yaw_deg=round(math.degrees(layer), 2), hand_yaw_deg=round(hand, 2))
+                    print(f"[fold] correction {number}: layer yaw={math.degrees(layer):.2f} deg, hand yaw={hand:.2f} deg",
+                          flush=True)
                 result["grasps"].append(record)
                 for attempt in range(1 + (args.retries if physical else 0)):
                     record["attempts"] = attempt + 1
@@ -555,10 +572,10 @@ def main():
                             # Sideways (world y, as the robot sees it) first at the safe height, then x
                             via = safe.clone()
                             via[1] = above[1]
-                            move(via, 120, goal_quat_w=grasp_quat)
+                            move(via, 120, goal_quat_w=approach_quat)
                             move(above, 120)
                         else:
-                            move(above, goal_quat_w=grasp_quat)
+                            move(above, goal_quat_w=approach_quat)
                     # Gap in free air, to tell "never opened fully" from "squeezed while descending"
                     record["open_gap_above_m"] = float(as_tensor(robot.data.joint_pos)[0, finger_ids].sum())
                     if len(finger_body_ids) == 2:
@@ -745,6 +762,10 @@ def main():
                                                    jaw_axis=args.jaw_axis, jaw_shift=args.pinch_jaw_shift,
                                                    axes_yaw=cloth_yaw) for v in corner_indices.tolist()]
                     result["pinch_vertices"] = pinch_vertices
+                    # Per corner: cloth points 6 cm along its two edges, to read a layer's direction later
+                    edge_vertices = [edge_reference_vertices(flat_nodes[:, :2], int(v), initial_center_xy, cloth_yaw)
+                                     for v in corner_indices.tolist()]
+                    result["edge_reference_vertices"] = edge_vertices
                     # Achieved offset from each corner (mesh spacing limits how exact it is)
                     result["pinch_offsets_mm"] = [
                         [round(float(d) * 1000, 1) for d in flat_nodes[p, :2] - flat_nodes[c, :2]]
