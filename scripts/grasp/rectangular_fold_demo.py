@@ -840,6 +840,9 @@ def main():
                     "grasps": result["grasps"], "max_drift_m": transport["max_drift_m"],
                     "slip_phase": transport["slip_phase"], "final_distances_m": result.get("final_distances_m"),
                     "applied": applied, "run_dir": str(run_dir),
+                    "corner_success": result.get("corner_success"),
+                    "shape_success": result.get("shape_success"),
+                    "shape_metrics": result.get("shape_metrics"),
                 }
                 print("[fold] RESULT " + json.dumps(summary), flush=True)
                 if rows:
@@ -874,7 +877,7 @@ def main():
                               f"({len(episode_log.segments)} pick/place, {len(episode_log.rows)} steps)", flush=True)
                     except Exception as exc:  # never lose the run because of the export
                         print(f"[fold] BC dataset export failed: {type(exc).__name__}: {exc}", flush=True)
-            if video_dir is not None and result["success"]:
+            if video_dir is not None and (result["success"] or args.save_all_videos) and result["status"] != "error":
                 clips = list(video_dir.glob("*.mp4"))
                 if not clips or not all(clip.stat().st_size > 0 for clip in clips):
                     raise RuntimeError(f"No video was saved; check the recording errors above: {video_dir}")
