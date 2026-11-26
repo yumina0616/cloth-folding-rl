@@ -1,5 +1,6 @@
 """Multi-episode PPO training using fresh Isaac processes."""
 import argparse
+import time
 import json
 import shutil
 import subprocess
@@ -57,6 +58,11 @@ def main():
         default=Path.home() / "IsaacLab/isaaclab.sh"
     )
 
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Resume from the last completed round"
+    )
+
     args = parser.parse_args()
 
     if min(args.rounds, args.episodes_per_round,
@@ -70,8 +76,114 @@ def main():
     current = args.bc_dir.resolve()
     output = args.output.resolve()
 
-    # Prevent mixing old and new experiment data.
-    output.mkdir(parents=True, exist_ok=False)
+    settings = {
+        "bc_dir": str(current),
+        "episodes_per_round": args.episodes_per_round,
+        "start_seed": args.start_seed,
+        "ppo_epochs": args.ppo_epochs,
+        "minibatch_size": args.minibatch_size,
+        "max_low_steps": args.max_low_steps,
+        "max_iterations": args.max_iterations,
+        "pos_jitter": args.pos_jitter,
+        "yaw_jitter": args.yaw_jitter,
+        "isaaclab": str(args.isaaclab.resolve()),
+    }
+
+    start_round = 0
+    settings_path = output / "training_config.json"
+
+    if args.resume:
+        if not settings_path.is_file():
+            raise RuntimeError(
+                "Resume requires training_config.json "
+                "from a compatible training run"
+            )
+
+        previous = json.loads(settings_path.read_text())
+
+        if previous != settings:
+            raise ValueError(
+                "Training settings differ from saved settings"
+            )
+
+        round_dirs = sorted(
+            d for d in output.glob("round_*")
+            if d.is_dir() and d.name[6:].isdigit()
+        )
+
+        incomplete = []
+
+        for folder in round_dirs:
+            number = int(folder.name[6:])
+            report_path = folder / "report.json"
+            checkpoint = folder / "checkpoint"
+
+            complete = (
+                report_path.is_file()
+                and all(
+                    (checkpoint / name).is_file()
+                    for name in (
+                        "high_bc_ppo.zip",
+                        "low_bc_ppo.zip",
+                        "low_action_bounds.json",
+                    )
+                )
+            )
+
+            if not complete:
+                incomplete.append(folder)
+                continue
+
+            report = json.loads(report_path.read_text())
+
+            if number != start_round + 1 or incomplete:
+                raise RuntimeError(
+                    "Checkpoint sequence is not contiguous"
+                )
+
+            if (
+                report["round"] != number
+                or len(report["episodes"])
+                != args.episodes_per_round
+            ):
+                raise RuntimeError("Invalid round report")
+
+            start_round = number
+            current = checkpoint
+
+        if args.rounds < start_round:
+            raise ValueError(
+                "Requested total rounds is below completed rounds"
+            )
+
+        for folder in incomplete:
+            backup = output / (
+                f"interrupted_{folder.name}_{time.time_ns()}"
+            )
+            folder.rename(backup)
+            print(
+                "[RECOVERY] Preserved incomplete round:",
+                backup, flush=True
+            )
+
+        print(
+            f"[RESUME] Completed rounds: {start_round}",
+            flush=True
+        )
+        print(
+            f"[RESUME] Next round: {start_round + 1}",
+            flush=True
+        )
+        print(
+            f"[RESUME] Checkpoint: {current}",
+            flush=True
+        )
+
+    else:
+        output.mkdir(parents=True, exist_ok=False)
+        tmp = settings_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(settings, indent=2))
+        tmp.replace(settings_path)
 
     for name in (
         "high_bc_ppo.zip",
@@ -81,7 +193,7 @@ def main():
         if not (current / name).is_file():
             raise FileNotFoundError(current / name)
 
-    for r in range(args.rounds):
+    for r in range(start_round, args.rounds):
         round_dir = output / f"round_{r+1:04d}"
         round_dir.mkdir()
 
@@ -241,8 +353,16 @@ def main():
             "low_update": low_stats,
         }
 
-        (round_dir / "report.json").write_text(
+        report_path = round_dir / "report.json"
+        tmp = report_path.with_suffix(".tmp")
+        tmp.write_text(
             json.dumps(report, indent=2, allow_nan=False)
+        )
+        tmp.replace(report_path)
+
+        print(
+            "[CHECKPOINT] Saved:", checkpoint,
+            flush=True
         )
 
         # The updated policy becomes the next round's policy.
@@ -253,7 +373,16 @@ def main():
             flush=True
         )
 
-    shutil.copytree(current, output / "final")
+    final_dir = output / "final"
+    temp_final = output / f"final_tmp_{time.time_ns()}"
+
+    shutil.copytree(current, temp_final)
+
+    if final_dir.exists():
+        backup = output / f"previous_final_{time.time_ns()}"
+        final_dir.rename(backup)
+
+    temp_final.rename(final_dir)
 
     print(
         "[COMPLETE] Final model:",
@@ -263,4 +392,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(
+            "\\n[INTERRUPTED] Training stopped by user. "
+            "Completed round checkpoints are preserved. "
+            "Use --resume to continue.",
+            flush=True
+        )
+        sys.exit(130)
