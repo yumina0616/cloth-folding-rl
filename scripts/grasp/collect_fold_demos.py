@@ -57,6 +57,8 @@ def parse_args(argv=None):
     parser.add_argument("--isaaclab", default=os.environ.get("ISAACLAB_LAUNCHER", "~/IsaacLab/isaaclab.sh"),
                         help="Isaac Lab launcher (isaaclab.sh / isaaclab.bat); env ISAACLAB_LAUNCHER")
     parser.add_argument("--run_timeout_s", type=float, default=1800, help="Kill a run that takes longer [s]")
+    parser.add_argument("--max_crashes_in_a_row", type=int, default=2,
+                        help="Stop when this many runs in a row end without a result (setup problem, not a fold)")
     args, demo_args = parser.parse_known_args(argv)
     demo_args = [a for a in demo_args if a != "--"]
     for name in RESERVED:
@@ -144,6 +146,10 @@ def main(argv=None):
     successes = sum(r["success"] == "True" for r in done)
     seed = max((int(r["seed"]) for r in done), default=args.start_seed - 1) + 1
     print(f"[collect] folder {out_dir}: {len(done)} runs, {successes} successes so far", flush=True)
+    if not os.environ.get("VIRTUAL_ENV") and not os.environ.get("CONDA_PREFIX"):
+        print("[collect] WARNING: no Python environment is active; activate the Isaac Lab environment first "
+              "(otherwise the launcher may fail with ModuleNotFoundError: tomllib)", flush=True)
+    crashes_in_a_row = 0
 
     while successes < args.successes and len(done) < args.max_runs:
         log_path = out_dir / "logs" / f"seed_{seed:04d}.log"
@@ -168,9 +174,19 @@ def main(argv=None):
             writer.writerow(row)
         done.append({k: str(v) for k, v in row.items()})
         successes += bool(row["success"])
+        crashes_in_a_row = crashes_in_a_row + 1 if row["status"] == "crashed" else 0
+        if row["status"] == "crashed":
+            tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-8:]
+            print("[collect]   last lines of " + str(log_path) + ":
+    " + "
+    ".join(tail), flush=True)
         print(f"[collect]   -> {row['status']} success={row['success']} final_mm={row['final_mm_1']},"
               f"{row['final_mm_2']} IoU={row['iou']} yaw={row['yaw_cmd_deg']}", flush=True)
         seed += 1
+        if crashes_in_a_row >= args.max_crashes_in_a_row:
+            print(f"[collect] stopping: {crashes_in_a_row} runs in a row ended without a result; "
+                  "fix the error above and continue with --resume", flush=True)
+            break
 
     ious = [float(r["iou"]) for r in done if r["success"] == "True" and r["iou"]]
     print(f"[collect] done: {successes} successes in {len(done)} runs "

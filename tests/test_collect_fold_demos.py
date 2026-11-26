@@ -46,7 +46,8 @@ class CollectTest(unittest.TestCase):
     def test_stops_at_target_successes_and_records_every_run(self):
         out = self.dir / "collect"
         code = COLLECT.main(["--successes", "2", "--pos_jitter", "0.02", "--yaw_jitter", "15",
-                             "--isaaclab", str(self.fake), "--out_dir", str(out), "--success_distance", "0.05"])
+                             "--isaaclab", str(self.fake), "--out_dir", str(out), "--success_distance", "0.05",
+                             "--max_crashes_in_a_row", "3"])
         self.assertEqual(code, 0)
         rows = self.rows(out)
         self.assertEqual([r["seed"] for r in rows], ["0", "1", "2", "3"])  # successes at seeds 0 and 3
@@ -73,6 +74,16 @@ class CollectTest(unittest.TestCase):
         self.assertEqual(len(self.rows(out)), 2)
         with self.assertRaises(SystemExit):
             COLLECT.parse_args(["--successes", "1", "--pos_jitter", "0", "--yaw_jitter", "0", "--seed", "3"])
+
+
+    def test_stops_early_when_every_run_crashes(self):
+        broken = self.dir / "broken.py"
+        broken.write_text("import sys; sys.exit('ModuleNotFoundError: No module named tomllib')")
+        out = self.dir / "collect"
+        code = COLLECT.main(["--successes", "2", "--pos_jitter", "0", "--yaw_jitter", "0",
+                             "--isaaclab", str(broken), "--out_dir", str(out)])
+        self.assertEqual(code, 1)
+        self.assertEqual(len(self.rows(out)), 2)  # stopped after 2 crashes, not 6 runs
 
 
 if __name__ == "__main__":
