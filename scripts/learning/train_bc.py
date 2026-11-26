@@ -13,6 +13,8 @@ BC teaches actor weights; PPO critics are not pretrained here.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import sys
 import json
 from pathlib import Path
 
@@ -102,8 +104,30 @@ def _validate(model, x, desired, level, low_bounds=None):
                       "gripper_sign_accuracy": gripper_accuracy}
 
 
+def _atomic_write(path, data):
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(data)
+    tmp.replace(path)
+
+
+def _save_checkpoint(path, state):
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(state, tmp)
+    tmp.replace(path)
+
+
+def _dataset_hash(*arrays):
+    h = hashlib.sha256()
+    for array in arrays:
+        a = np.ascontiguousarray(array)
+        h.update(str(a.shape).encode())
+        h.update(str(a.dtype).encode())
+        h.update(memoryview(a).cast("B"))
+    return h.hexdigest()
+
+
 def train(episodes, output, *, epochs=100, batch_size=64, seed=0, device="cpu",
-          validation_fraction=0.2, position_margin_m=0.05):
+          validation_fraction=0.2, position_margin_m=0.05, resume=False):
     """Train separate PPO actors using BC; keep existing 4-D BC files untouched."""
     if epochs < 1 or batch_size < 1:
         raise ValueError("epochs and batch_size must be positive")
@@ -130,6 +154,59 @@ def train(episodes, output, *, epochs=100, batch_size=64, seed=0, device="cpu",
               "low": lower.tolist(), "high": upper.tolist(),
               "position_margin_m": position_margin_m,
               "source": "training episodes only"}
+    checkpoint_dir = output / "checkpoints"
+    settings_path = output / "bc_training_config.json"
+
+    settings = {
+        "contract": VERSION,
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "seed": seed,
+        "device": str(device),
+        "validation_fraction": validation_fraction,
+        "position_margin_m": position_margin_m,
+        "train_episodes": [str(e.path) for e in train_set],
+        "validation_episodes": [str(e.path) for e in val_set],
+        "dataset_hash": _dataset_hash(
+            hx, hy, hvx, hvy, lx, ly, lvx, lvy
+        ),
+        "bounds": bounds,
+    }
+
+    if resume:
+        if not settings_path.is_file():
+            raise ValueError(
+                "No compatible BC training configuration found"
+            )
+
+        saved = json.loads(settings_path.read_text())
+        if saved != settings:
+            raise ValueError(
+                "BC dataset or training settings have changed"
+            )
+
+        print("[BC RESUME] Training settings verified", flush=True)
+    else:
+        if settings_path.exists() or any(
+            (output / name).exists()
+            for name in (
+                "high_bc_ppo.zip",
+                "low_bc_ppo.zip",
+                "bc_training_report.json",
+                "checkpoints",
+            )
+        ):
+            raise ValueError(
+                "Existing BC run. Use --resume or a new output directory"
+            )
+
+        _atomic_write(
+            settings_path,
+            json.dumps(settings, indent=2).encode("utf-8")
+        )
+
+    checkpoint_dir.mkdir(exist_ok=True)
+
     (output / "low_action_bounds.json").write_text(
         json.dumps(bounds, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -151,7 +228,53 @@ def train(episodes, output, *, epochs=100, batch_size=64, seed=0, device="cpu",
         optimizer = model.policy.optimizer
         best = float("inf")
         history = []
-        for epoch in range(epochs):
+        start_epoch = 0
+
+        checkpoint = checkpoint_dir / f"{level}_latest.pt"
+        best_path = output / (filename + ".zip")
+
+        if resume and checkpoint.is_file():
+            state = torch.load(
+                checkpoint,
+                map_location="cpu",
+                weights_only=True,
+            )
+
+            if (
+                state["contract"] != VERSION
+                or state["level"] != level
+            ):
+                raise ValueError("BC checkpoint mismatch")
+
+            start_epoch = int(state["completed_epochs"])
+            history = state["history"]
+            best = float(state["best"])
+
+            if not 1 <= start_epoch <= epochs:
+                raise ValueError("Invalid checkpoint epoch")
+
+            if len(history) != start_epoch:
+                raise ValueError("Invalid checkpoint history")
+
+            model.policy.load_state_dict(state["policy"])
+            optimizer.load_state_dict(state["optimizer"])
+
+            _atomic_write(
+                best_path, state["best_model_zip"]
+            )
+
+            torch.set_rng_state(state["torch_rng"])
+
+            if state["cuda_rng"] is not None:
+                torch.cuda.set_rng_state_all(state["cuda_rng"])
+
+            print(
+                f"[BC RESUME] {level}: "
+                f"completed={start_epoch}/{epochs}",
+                flush=True
+            )
+
+        for epoch in range(start_epoch, epochs):
             model.policy.set_training_mode(True)
             for indices in torch.randperm(len(x), device=model.device).split(batch_size):
                 prediction = model.policy.get_distribution(x[indices]).distribution.mean
@@ -165,7 +288,35 @@ def train(episodes, output, *, epochs=100, batch_size=64, seed=0, device="cpu",
             history.append({"epoch": epoch + 1, **metrics})
             if score < best:
                 best = score
-                model.save(output / filename)
+                temp_model = output / (filename + ".tmp.zip")
+                model.save(temp_model)
+                temp_model.replace(best_path)
+
+            state = {
+                "contract": VERSION,
+                "level": level,
+                "completed_epochs": epoch + 1,
+                "policy": model.policy.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "best": best,
+                "history": history,
+                "best_model_zip": best_path.read_bytes(),
+                "torch_rng": torch.get_rng_state(),
+                "cuda_rng": (
+                    torch.cuda.get_rng_state_all()
+                    if model.device.type == "cuda"
+                    else None
+                ),
+            }
+
+            _save_checkpoint(checkpoint, state)
+
+            print(
+                f"[BC CHECKPOINT] {level} "
+                f"epoch={epoch + 1}/{epochs}",
+                flush=True
+            )
+
             if epoch == 0 or (epoch + 1) % 10 == 0:
                 print(f"[{level}] epoch={epoch + 1} {metrics}", flush=True)
         report[level] = {"best_validation_score": best, "history": history,
@@ -186,6 +337,10 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--position_margin_m", type=float, default=0.05)
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Resume BC from the last completed epoch"
+    )
     args = parser.parse_args()
     episodes, rejected = load_episodes(args.data)
     args.output.mkdir(parents=True, exist_ok=True)
@@ -197,7 +352,9 @@ def main():
     try:
         result = train(episodes, args.output, epochs=args.epochs,
                        batch_size=args.batch_size, validation_fraction=args.validation_fraction,
-                       seed=args.seed, device=args.device, position_margin_m=args.position_margin_m)
+                       seed=args.seed, device=args.device,
+                       position_margin_m=args.position_margin_m,
+                       resume=args.resume)
     except ValueError as error:
         parser.error(str(error))
     print(json.dumps({"high_checkpoint": result["high"]["checkpoint"],
@@ -205,4 +362,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(
+            "\\n[BC INTERRUPTED] Completed epoch checkpoints "
+            "are preserved. Use --resume to continue.",
+            flush=True
+        )
+        sys.exit(130)
