@@ -31,11 +31,12 @@ import gymnasium as gym
 import numpy as np
 import torch
 from isaaclab.app import add_launcher_args, launch_simulation
-from isaaclab_tasks.utils import resolve_task_config, setup_preset_cli
+from isaaclab_tasks.utils import setup_preset_cli
+from task_config_compat import resolve_cloth_task_config
 import isaaclab.sim as sim_utils
 import isaaclab_tasks  # noqa: F401: register Isaac-Lift-Cloth-Franka
 
-from rectangular_fold_geometry import rectangular_pairs
+from rectangular_fold_geometry import rectangular_pairs, axis_pairs, cloth_yaw_from_corners
 from run_config import DEFAULT_CONFIG, apply_config_defaults
 from scripts.learning.policy_contract import (
     VERSION, decode_action, decode_low_action,
@@ -45,9 +46,12 @@ from scripts.learning.policy_contract import (
 from scripts.rl.fold_executor import BatchedFoldExecutor, configure_fold_cfg
 from scripts.rl.hybrid_ppo_bridge import HybridPPOBridge
 from scripts.rl.fold_mdp import pair_distances
+from scripts.metrics.fold_shape_metric import fold_shape_success
 
 
 def _as_numpy(tensor):
+    if hasattr(tensor, "torch"):
+        tensor = tensor.torch
     if isinstance(tensor, torch.Tensor):
         return tensor.detach().cpu().numpy()
     return np.asarray(tensor)
@@ -101,7 +105,7 @@ def policy_observation(bridge, grasp_mode, level):
     return encode_low_observation(corners, tcp, previous, pair_idx, grasping, distances)
 
 
-def run_episode(bridge, high_model, low_model, grasp_mode, low_bounds, *, max_iterations):
+def run_episode(bridge, high_model, low_model, grasp_mode, low_bounds, *, max_iterations, oracle_pick=False):
     """Run one episode using frozen BC policies; no PPO gradient updates."""
     lower, upper = low_bounds
     log = []
@@ -113,6 +117,14 @@ def run_episode(bridge, high_model, low_model, grasp_mode, low_bounds, *, max_it
             obs = policy_observation(bridge, grasp_mode, "high")
             output, _ = high_model.predict(obs, deterministic=True)
             pick_xy = decode_action(output)
+            source = bridge.pairs[int(bridge.pair_index[0])][0]
+            source_tensor = torch.tensor([source], device=bridge.device)
+            reference_xy = _as_numpy(bridge.ex.grasp_target(source_tensor))[0, :2]
+            predicted_xy = pick_xy.copy()
+            if oracle_pick:
+                pick_xy = reference_xy.copy()
+            print("[BC] Pick predicted:", predicted_xy.tolist(),
+                  "reference:", reference_xy.tolist(), flush=True)
             _, info = bridge.begin_pick(torch.as_tensor(pick_xy[None, :], device=bridge.device))
             log.append({"event": "pick", "pair_index": int(bridge.pair_index[0]),
                         "world_pick_xy": pick_xy.tolist(),
@@ -132,6 +144,11 @@ def run_episode(bridge, high_model, low_model, grasp_mode, low_bounds, *, max_it
                             "pair_index": int(info["pair_index"][0]),
                             "released": bool(info["released"][0]),
                             "invalid": bool(info["invalid"][0]),
+                            "dropped": bool(info["status"]["dropped"][0]),
+                            "slipped": bool(info["status"]["slipped"][0]),
+                            "lift_verified": bool(info["status"]["lift_verified"][0]),
+                            "timeout": bool(info["timeout"][0]),
+                            "low_steps": int(bridge.low_steps[0]),
                             "reward": float(reward[0])})
     else:
         raise RuntimeError("Evaluation exceeded max_iterations; episode did not finish")
@@ -303,6 +320,8 @@ def build_parser():
     parser.add_argument("--finger_static_friction", type=float, default=2.)
     parser.add_argument("--gripper_effort", type=float, default=70.)
     parser.add_argument("--retries", type=int, default=1)
+    parser.add_argument("--oracle_pick", action="store_true")
+    parser.add_argument("--shape_iou_threshold", type=float, default=0.75)
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     return parser
 
@@ -323,7 +342,9 @@ def main():
     sys.argv = [sys.argv[0], *hydra_args]
     high_model, low_model, lower, upper = load_bc_models(args.bc_dir, args.grasp_mode, args.device)
 
-    cfg, _ = resolve_task_config("Isaac-Lift-Cloth-Franka", "")
+    cfg, _ = resolve_cloth_task_config("Isaac-Lift-Cloth-Franka", "")
+    cfg.seed = 0
+    cfg.sim.device = args.device
     material = cfg.scene.deformable.spawn.physics_material
     material.surface_bend_stiffness = args.bend_stiffness
     material.youngs_modulus = args.youngs_modulus
@@ -341,6 +362,7 @@ def main():
     cfg.scene.deformable.spawn.size = (args.cloth_size, args.cloth_size)
     cfg.scene.deformable.spawn.edge_refinement = args.mesh_refinement
     cfg.scene.deformable.init_state.pos = (args.cloth_x, args.cloth_y, .012)
+    cfg.scene.deformable.init_state.rot = (1.0, 0.0, 0.0, 0.0)
     cfg.scene.table.spawn.size = (args.table_length, args.table_width, 1.05)
     if args.table_friction is not None:
         cfg.scene.table.spawn.physics_material = sim_utils.RigidBodyMaterialCfg(
@@ -362,15 +384,33 @@ def main():
                     press_depth=args.press_depth, retries=args.retries)
                 executor.hold(120)
                 executor.detect_corners()
-                initial_corners = executor.corners()
+                initial_corners = executor.corners().clone()
                 root = executor.robot.data.root_pos_w
                 root_xy = _as_numpy(root)[0, :2]
-                pairs = rectangular_pairs(initial_corners[0],
-                                          torch.as_tensor(root_xy, device=executor.device))
+                robot_xy = torch.as_tensor(root_xy, device=executor.device)
+                if args.grasp_mode == "physical":
+                    yaw = cloth_yaw_from_corners(initial_corners[0])
+                    pairs = axis_pairs(initial_corners[0], robot_xy, "y", yaw)
+                else:
+                    pairs = rectangular_pairs(initial_corners[0], robot_xy)
+                print("[BC] Initial corners:", initial_corners.tolist(), flush=True)
+                print("[BC] Goal pairs:", pairs, flush=True)
+                def shape_success_fn(i):
+                    ok, _ = fold_shape_success(
+                        executor.nodes()[i],
+                        initial_corners[i],
+                        executor.corners()[i],
+                        pairs,
+                        min_iou=args.shape_iou_threshold,
+                        cloth_size=args.cloth_size,
+                    )
+                    return bool(ok)
+
                 bridge = HybridPPOBridge(executor, pairs,
                                          success_threshold=args.success_distance,
                                          settle_seconds=args.settle_seconds,
-                                         max_low_steps=args.max_low_steps)
+                                         max_low_steps=args.max_low_steps,
+                                         shape_success_fn=shape_success_fn)
                 if args.task == "ppo":
                     stats = train_one_ppo_episode(
                         bridge, high_model, low_model, args.grasp_mode,
@@ -381,7 +421,17 @@ def main():
                 else:
                     result = run_episode(bridge, high_model, low_model,
                                          args.grasp_mode, (lower, upper),
-                                         max_iterations=args.max_iterations)
+                                         max_iterations=args.max_iterations,
+                                         oracle_pick=args.oracle_pick)
+                    shape_ok, shape_metrics = fold_shape_success(
+                        executor.nodes()[0], initial_corners[0],
+                        executor.corners()[0], pairs,
+                        min_iou=args.shape_iou_threshold,
+                        cloth_size=args.cloth_size)
+                    result["corner_success"] = result["success"]
+                    result["shape_success"] = bool(shape_ok)
+                    result["shape_metrics"] = shape_metrics
+                    result["success"] = bool(result["success"] and shape_ok)
                     print("BC_EVAL " + json.dumps(result, ensure_ascii=False), flush=True)
                 executor.release_all()
         finally:

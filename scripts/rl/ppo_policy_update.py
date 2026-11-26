@@ -65,6 +65,7 @@ def advantages_from_complete_episodes(episodes, *, gamma=0.99, gae_lambda=0.95):
     return flat, np.asarray(advantages, dtype=np.float32), np.asarray(returns, dtype=np.float32)
 
 
+@torch.enable_grad()
 def ppo_update(model, episodes, *, epochs=4, minibatch_size=64,
                gamma=0.99, gae_lambda=0.95, clip_range=0.2,
                value_coef=0.5, entropy_coef=0.0, max_grad_norm=0.5):
