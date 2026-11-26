@@ -17,8 +17,7 @@ This script does not import Isaac Lab. Run it with the Isaac Lab Python environm
 (the launcher it calls uses that environment), from the repository root, for example:
 
     python3 scripts/grasp/collect_fold_demos.py --successes 20 --pos_jitter 0.02 --yaw_jitter 15 \\
-        --success_distance 0.05 --shape_iou_threshold 0 \\
-        --table_friction 0.6 --table_static_friction 0.65 presets=isaacsim_physx
+        --success_distance 0.05 --shape_iou_threshold 0 presets=isaacsim_physx
 
 Options this script does not know are passed to rectangular_fold_demo.py unchanged.
 """
