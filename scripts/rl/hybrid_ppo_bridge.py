@@ -24,7 +24,8 @@ class HybridPPOBridge:
     DONE = 3
 
     def __init__(self, executor, pairs, *, success_threshold=0.02,
-                 settle_seconds=1.0, max_low_steps=1000):
+                 settle_seconds=1.0, max_low_steps=1000,
+                 shape_success_fn=None):
         if len(pairs) != 2:
             raise ValueError("Expected exactly two ordered source-destination pairs")
         if success_threshold <= 0 or settle_seconds < 0 or max_low_steps < 1:
@@ -35,6 +36,7 @@ class HybridPPOBridge:
         self.threshold = float(success_threshold)
         self.settle_steps = math.ceil(settle_seconds / executor.base.physics_dt)
         self.max_low_steps = max_low_steps
+        self.shape_success_fn = shape_success_fn
         self.reset_tracking()
 
     def reset_tracking(self):
@@ -142,6 +144,9 @@ class HybridPPOBridge:
 
         all_pairs_success = fold_success(after, self.pairs, self.threshold)
         success = final_pair & all_pairs_success
+        if self.shape_success_fn is not None:
+            for i in torch.where(success)[0].tolist():
+                success[i] = bool(self.shape_success_fn(i))
         # Final success bonus only once, on completion; no false repeated bonus.
         reward = fold_reward(before, after, self.pairs, success, failure)
         reward = torch.where(active | completed, reward, torch.zeros_like(reward))

@@ -38,13 +38,16 @@ from pathlib import Path
 
 import torch
 
-from isaaclab.utils.math import subtract_frame_transforms
+from isaaclab.utils.math import (
+    subtract_frame_transforms, quat_from_euler_xyz, quat_mul,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 for folder in (ROOT, ROOT / "scripts" / "grasp", ROOT / "scripts" / "corner_tracking"):
     if str(folder) not in sys.path:
         sys.path.insert(0, str(folder))
 
+from rectangular_fold_geometry import cloth_yaw_from_corners
 from cloth_corner_tracker import detect_corner_vertex_indices  # noqa: E402
 from physical_picker import as_tensor, create_picker, pinch_vertex  # noqa: E402
 
@@ -133,7 +136,9 @@ class BatchedFoldExecutor:
                  settle_seconds=3.0, grasp_radius=None,
                  # physical grasp (demo defaults, experiment 008 / PR #28)
                  open_width=0.04, pad_half=0.01, edge_margin=0.005, press_depth=0.0,
-                 grasp_settle_s=0.5, check_lift=0.06, check_lift_s=2.0, check_hold_s=1.0,
+                 close_lift=0.002, pinch_jaw_shift=0.01,
+                 free_speed=2.0,
+                 grasp_settle_s=0.5, check_lift=0.02, check_lift_s=2.0, check_hold_s=1.0,
                  check_min_rise=0.015, quality_max=0.0, retries=1,
                  slip_drift=0.02, drop_height=0.01, drop_hand_height=0.06):
         if grasp_mode not in GRASP_MODES:
@@ -150,6 +155,9 @@ class BatchedFoldExecutor:
         dt = self.base.physics_dt
         self.settle_steps = math.ceil(settle_seconds / dt)
         self.open_width, self.pad_half, self.edge_margin, self.press_depth = open_width, pad_half, edge_margin, press_depth
+        self.close_lift = close_lift
+        self.pinch_jaw_shift = pinch_jaw_shift
+        self.free_speed = free_speed
         self.grasp_settle_steps = math.ceil(grasp_settle_s / dt)
         self.check_lift, self.check_lift_steps = check_lift, max(1, math.ceil(check_lift_s / dt))
         self.check_hold_steps = math.ceil(check_hold_s / dt)
@@ -206,13 +214,22 @@ class BatchedFoldExecutor:
         """Call once on the flat cloth (after env.reset() and a short hold)."""
         nodes = self.nodes()
         self.corner_indices = torch.stack([detect_corner_vertex_indices(nodes[i]) for i in range(self.num_envs)])
+        self.grasp_quat_w = self.action.new_tensor(DOWN_QUAT).repeat(self.num_envs, 1)
         if self.physical:
             pinch = []
             for i in range(self.num_envs):
                 flat_xy = nodes[i, :, :2].clone()
                 center_xy = nodes[i, self.corner_indices[i], :2].mean(dim=0)
+                yaw = cloth_yaw_from_corners(nodes[i, self.corner_indices[i]])
+                angle = self.action.new_tensor([yaw])
+                zero = torch.zeros_like(angle)
+                turn = quat_from_euler_xyz(zero, zero, angle)
+                self.grasp_quat_w[i] = quat_mul(
+                    turn, self.grasp_quat_w[i:i+1])[0]
                 pinch.append([pinch_vertex(flat_xy, int(v), center_xy, self.open_width, pad_half=self.pad_half,
-                                           edge_margin=self.edge_margin, jaw_axis="y")
+                                           edge_margin=self.edge_margin, jaw_axis="y",
+                                           jaw_shift=self.pinch_jaw_shift,
+                                           axes_yaw=yaw)
                               for v in self.corner_indices[i].tolist()])
             self.pinch_indices = torch.tensor(pinch, dtype=torch.long, device=self.device)
         return self.corner_indices
@@ -466,12 +483,19 @@ class BatchedFoldExecutor:
             above[:, 2] += APPROACH_HEIGHT
             safe = self.tcp().clone()
             safe[:, 2] = torch.maximum(safe[:, 2], above[:, 2])  # rise vertically before crossing the cloth
-            self.move(safe, 120, trying)
-            self.move(above, 240, trying, goal_quat_w=self.action.new_tensor(DOWN_QUAT))
+            speed = self.free_speed if self.physical else 1.0
+            self.move(safe, max(1, round(120 / speed)), trying)
+            self.move(above, max(1, round(240 / speed)), trying,
+                      goal_quat_w=self.grasp_quat_w)
             touch = self.grasp_target(source) if policy_target is None else policy_target.clone()
             # Physical: fingertips on the cloth (the table stops them). Virtual: 1.5 cm above the corner.
             touch[:, 2] += -self.press_depth if self.physical else TOUCH_HEIGHT
-            reach_error = self.move(touch, 180, trying, max_wait=60 if self.physical else 1200)
+            reach_error = self.move(touch, max(1, round(180 / speed)), trying,
+                                    max_wait=60 if self.physical else 1200)
+            if self.physical and self.close_lift > 0:
+                lifted = self.tcp().clone()
+                lifted[:, 2] += self.close_lift
+                self.move(lifted, max(1, round(60 / speed)), trying, max_wait=60)
             self.set_gripper(True, trying)
 
             attached = torch.zeros(n, dtype=torch.bool, device=self.device)
@@ -493,7 +517,7 @@ class BatchedFoldExecutor:
                 # No automatic lift: proximity/vertex registration is not proof
                 # of a successful physical grasp. The policy must lift to verify.
                 if self.physical:
-                    self.hold(self.grasp_settle_steps)
+                    self.hold(1)
                 passed = attached
             ok |= passed
             # Remember the corner-to-hand offset from the settled grip
