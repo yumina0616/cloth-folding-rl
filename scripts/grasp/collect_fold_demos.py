@@ -177,9 +177,9 @@ def main(argv=None):
         crashes_in_a_row = crashes_in_a_row + 1 if row["status"] == "crashed" else 0
         if row["status"] == "crashed":
             tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-8:]
-            print("[collect]   last lines of " + str(log_path) + ":
-    " + "
-    ".join(tail), flush=True)
+            print(f"[collect]   last lines of {log_path}:", flush=True)
+            for line in tail:
+                print(f"    {line}", flush=True)
         print(f"[collect]   -> {row['status']} success={row['success']} final_mm={row['final_mm_1']},"
               f"{row['final_mm_2']} IoU={row['iou']} yaw={row['yaw_cmd_deg']}", flush=True)
         seed += 1
