@@ -46,13 +46,23 @@ class ClothYawTest(unittest.TestCase):
             side = 1.0 if float(robot[k] - center[k]) >= 0 else -1.0
             order = sorted(range(4), key=lambda i: -side * float(c[i, k] - center[k]))
             old = [(src, min(order[2:], key=lambda d: abs(float(c[d, 1 - k] - c[src, 1 - k])))) for src in order[:2]]
-            self.assertEqual(GEOMETRY.axis_pairs(corners, robot, axis), old)
+            # Same pairs as the old world-axis rule; only their order is now fixed
+            # (the source on the robot's side along the other axis first)
+            self.assertEqual(sorted(GEOMETRY.axis_pairs(corners, robot, axis)), sorted(old))
+            first = GEOMETRY.axis_pairs(corners, robot, axis)[0][0]
+            j = 1 - k
+            toward_robot = 1.0 if float(robot[j] - center[j]) >= 0 else -1.0
+            self.assertEqual(first, max((src for src, _ in old), key=lambda i: toward_robot * float(c[i, j])))
 
     def test_axis_pairs_follow_the_cloth(self):
         robot = torch.tensor([0.0, 0.0])
         for axis in ("x", "y"):
             expected = GEOMETRY.axis_pairs(square(0.0), robot, axis)
-            self.assertEqual(GEOMETRY.axis_pairs(square(15.0), robot, axis, math.radians(15.0)), expected)
+            # Same corners and the same fold direction for any rotation in +-15 deg (negative ones too:
+            # judging the robot side along the cloth axis used to flip the direction below about -6 deg)
+            for yaw_deg in (15.0, 5.0, -5.0, -7.0, -13.3, -15.0):
+                got = GEOMETRY.axis_pairs(square(yaw_deg), robot, axis, math.radians(yaw_deg))
+                self.assertEqual(got, expected, (axis, yaw_deg))
 
 
 class RotatedPinchTest(unittest.TestCase):

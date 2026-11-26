@@ -52,22 +52,34 @@ def to_cloth_frame(points_xy, center_xy, yaw):
 
 
 def axis_pairs(corners, robot_xy, axis, yaw=0.0):
-    """Pairs that move the two corners nearest the robot along a cloth axis ("x" or "y").
+    """Pairs that move the two corners on the robot's side along a cloth axis ("x" or "y").
 
     With yaw = 0 this is the old --move_axis x/y rule in world axes; with a rotated cloth the
-    axes are the cloth's own edges.
+    axes are the cloth's own edges. Which side counts as the robot's side is decided in WORLD
+    axes (robot minus cloth center along world x or y), as in the old rule: the robot sits about
+    0.5 m away in x but only ~5 cm away in y, so judging it along the rotated cloth y axis flipped
+    the fold direction once the cloth was turned about -6 deg or more.
     """
     if axis not in ("x", "y"):
         raise ValueError("axis must be 'x' or 'y'")
+    if abs(yaw) >= math.pi / 4:
+        raise ValueError("yaw must be within +-45 deg (cloth axes nearest the world axes)")
     xy = torch.as_tensor(corners)[:, :2]
     center = xy.mean(0)
     c = to_cloth_frame(xy, center, yaw)
-    robot = to_cloth_frame(torch.as_tensor(robot_xy)[:2], center, yaw)
     k = 0 if axis == "x" else 1
-    side = 1.0 if float(robot[k]) >= 0 else -1.0
+    robot_offset = float(torch.as_tensor(robot_xy)[k] - center[k])  # world axis k
+    # The cloth axis k points the same way as world axis k (|yaw| < 45 deg), so the sign carries over
+    side = 1.0 if robot_offset >= 0 else -1.0
     order = sorted(range(4), key=lambda i: -side * float(c[i, k]))
     dests = order[2:]
-    return [(src, min(dests, key=lambda d: abs(float(c[d, 1 - k] - c[src, 1 - k])))) for src in order[:2]]
+    # The two source corners lie on the same edge, so their order above is a near tie (it flipped with
+    # tiny rotations). Fold first the one on the robot's side along the OTHER cloth axis; that side is
+    # again judged in world axes, so the order does not change with the rotation.
+    other_offset = float(torch.as_tensor(robot_xy)[1 - k] - center[1 - k])
+    other_side = 1.0 if other_offset >= 0 else -1.0
+    sources = sorted(order[:2], key=lambda i: -other_side * float(c[i, 1 - k]))
+    return [(src, min(dests, key=lambda d: abs(float(c[d, 1 - k] - c[src, 1 - k])))) for src in sources]
 
 
 def rotate_nodes_about_center(nodes, yaw):
