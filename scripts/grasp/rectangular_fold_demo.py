@@ -69,6 +69,7 @@ class CorrectionNotNeeded(Exception):
 
 
 # (virtual / earlier default, tuned physical default). Any of them can still be set on the command line.
+PHYSICAL_TABLE_FRICTION = (1.0, 1.05)  # (dynamic, static), physical mode default; see main()
 TUNED_PHYSICAL_DEFAULTS = {
     "pinch_jaw_shift": (0.0, 0.01),    # pinch point 1 cm closer to the corner along the jaw axis
     "close_lift": (0.0, 0.002),        # lift 2 mm off the table before closing
@@ -84,6 +85,7 @@ TUNED_PHYSICAL_DEFAULTS = {
 
 
 def main():
+    cli_args = sys.argv[1:]  # what was typed, before the config file fills in defaults
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--grasp_mode", choices=["virtual", "physical"], default="virtual")
     parser.add_argument("--grasp_radius", type=float, default=0.03)
@@ -202,6 +204,13 @@ def main():
     for name, (virtual_value, physical_value) in TUNED_PHYSICAL_DEFAULTS.items():
         if getattr(args, name) is None:
             setattr(args, name, physical_value if args.grasp_mode == "physical" else virtual_value)
+    # Physical fold: cloth-table friction 1.0 / 1.05 (min combine with cloth 10 -> 1.0; a non-slip mat
+    # rather than a bare table). At 0.6 the edge that should stay put slid 5-12 cm in failed runs
+    # (1-1.5 cm in successful ones), 2026-11-26. Only when neither table friction option is typed;
+    # the shared configs/cloth_unified.json (0.3 / 0.31) is left unchanged for other scripts.
+    typed = lambda name: any(a == f"--{name}" or a.startswith(f"--{name}=") for a in cli_args)
+    if args.grasp_mode == "physical" and not typed("table_friction") and not typed("table_static_friction"):
+        args.table_friction, args.table_static_friction = PHYSICAL_TABLE_FRICTION
     for name in ("lift_height", "settle_seconds", "success_distance", "bend_stiffness",
                  "cloth_size", "mesh_refinement", "table_length", "table_width", "youngs_modulus",
                  "cloth_thickness", "cloth_density"):
