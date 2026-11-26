@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 import sys
 from pathlib import Path
 
@@ -36,7 +37,10 @@ from task_config_compat import resolve_cloth_task_config
 import isaaclab.sim as sim_utils
 import isaaclab_tasks  # noqa: F401: register Isaac-Lift-Cloth-Franka
 
-from rectangular_fold_geometry import rectangular_pairs, axis_pairs, cloth_yaw_from_corners
+from rectangular_fold_geometry import (
+    rectangular_pairs, axis_pairs,
+    cloth_yaw_from_corners, rotate_nodes_about_center,
+)
 from run_config import DEFAULT_CONFIG, apply_config_defaults
 from scripts.learning.policy_contract import (
     VERSION, decode_action, decode_low_action,
@@ -166,7 +170,9 @@ def run_episode(bridge, high_model, low_model, grasp_mode, low_bounds, *, max_it
 
 
 
-def collect_ppo_episode(bridge, high_model, low_model, grasp_mode, low_bounds, *, max_iterations):
+def collect_ppo_episode(bridge, high_model, low_model,
+                        grasp_mode, low_bounds, *,
+                        max_iterations, allow_empty_low=False):
     """Collect one fresh, complete on-policy episode from the existing bridge.
 
     High-level decisions are temporal options: their reward is the sum of the
@@ -181,6 +187,7 @@ def collect_ppo_episode(bridge, high_model, low_model, grasp_mode, low_bounds, *
     low_episodes = []
     current_low = []
     pending_high = None
+    events = []
     for _ in range(max_iterations):
         phase = int(bridge.phase[0].item())
         if phase == bridge.DONE:
@@ -193,6 +200,12 @@ def collect_ppo_episode(bridge, high_model, low_model, grasp_mode, low_bounds, *
             pick_xy = decode_action(raw)
             _, info = bridge.begin_pick(torch.as_tensor(pick_xy[None, :], device=bridge.device))
             pending_high = PPOTransition(obs, raw, log_prob, value, 0.0, False)
+            events.append({
+                "event": "pick",
+                "pair_index": int(bridge.pair_index[0]),
+                "initialized": bool(info["pick_initialized"][0]),
+            })
+
             if not bool(info["pick_initialized"][0]):
                 # Failed scripted pick: no low-level action exists for this option.
                 pending_high.reward -= 1.0
@@ -225,6 +238,16 @@ def collect_ppo_episode(bridge, high_model, low_model, grasp_mode, low_bounds, *
         pending_high.reward += reward
         new_phase = int(bridge.phase[0].item())
         if new_phase in (bridge.PICK, bridge.DONE):
+            events.append({
+                "event": "low_transition",
+                "slipped": bool(info["status"]["slipped"][0]),
+                "dropped": bool(info["status"]["dropped"][0]),
+                "lift_verified": bool(info["status"]["lift_verified"][0]),
+                "timeout": bool(info["timeout"][0]),
+                "released": bool(info["released"][0]),
+                "invalid": bool(info["invalid"][0]),
+                "low_samples": len(current_low),
+            })
             if not current_low:
                 raise RuntimeError("Completed option without low-level actions")
             current_low[-1].done = True
@@ -242,8 +265,9 @@ def collect_ppo_episode(bridge, high_model, low_model, grasp_mode, low_bounds, *
         raise RuntimeError("Missing terminal high-level transition")
     # Failed first picks can train high alone, but the two-policy updater
     # explicitly requires both policies to have at least one real sample.
-    if not low_episodes:
+    if not low_episodes and not allow_empty_low:
         raise RuntimeError("No low-level samples; skip the two-policy update")
+    bridge.rollout_events = events
     return [high_transitions], low_episodes
 
 
@@ -286,8 +310,12 @@ def train_one_ppo_episode(bridge, high_model, low_model, grasp_mode, low_bounds,
 
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--task", choices=["evaluate", "ppo"], default="evaluate")
+    parser.add_argument("--task", choices=["evaluate", "ppo", "collect"], default="evaluate")
     parser.add_argument("--ppo_output", type=Path, default=Path("runs/learning/ppo_single_episode"))
+    parser.add_argument(
+        "--rollout_output",
+        type=Path,
+        default=Path("runs/learning/rollout.json"))
     parser.add_argument("--ppo_epochs", type=int, default=4)
     parser.add_argument("--ppo_minibatch_size", type=int, default=64)
     parser.add_argument("--bc_dir", type=Path, default=Path("runs/learning/bc_hierarchical"))
@@ -300,6 +328,10 @@ def build_parser():
     parser.add_argument("--success_distance", type=float, default=.02)
     parser.add_argument("--cloth_x", type=float, default=.5)
     parser.add_argument("--cloth_y", type=float, default=-.05)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--pos_jitter", type=float, default=0.0)
+    parser.add_argument("--yaw_jitter", type=float, default=0.0)
+    parser.add_argument("--cloth_yaw_deg", type=float, default=0.0)
     parser.add_argument("--cloth_size", type=float, default=.30)
     parser.add_argument("--mesh_refinement", type=float, default=32.)
     parser.add_argument("--cloth_thickness", type=float, default=.003)
@@ -343,7 +375,23 @@ def main():
     high_model, low_model, lower, upper = load_bc_models(args.bc_dir, args.grasp_mode, args.device)
 
     cfg, _ = resolve_cloth_task_config("Isaac-Lift-Cloth-Franka", "")
-    cfg.seed = 0
+    cfg.seed = args.seed
+
+    rng = random.Random(args.seed)
+    start_x = args.cloth_x + rng.uniform(
+        -args.pos_jitter, args.pos_jitter)
+    start_y = args.cloth_y + rng.uniform(
+        -args.pos_jitter, args.pos_jitter)
+    start_yaw = args.cloth_yaw_deg + (
+        rng.uniform(-args.yaw_jitter, args.yaw_jitter)
+        if args.yaw_jitter else 0.0)
+
+    print("[INIT]", json.dumps({
+        "seed": args.seed,
+        "x": start_x,
+        "y": start_y,
+        "yaw_deg": start_yaw,
+    }), flush=True)
     cfg.sim.device = args.device
     material = cfg.scene.deformable.spawn.physics_material
     material.surface_bend_stiffness = args.bend_stiffness
@@ -361,7 +409,7 @@ def main():
     cfg.scene.deformable.spawn.deformable_props.self_collision = True
     cfg.scene.deformable.spawn.size = (args.cloth_size, args.cloth_size)
     cfg.scene.deformable.spawn.edge_refinement = args.mesh_refinement
-    cfg.scene.deformable.init_state.pos = (args.cloth_x, args.cloth_y, .012)
+    cfg.scene.deformable.init_state.pos = (start_x, start_y, .012)
     cfg.scene.deformable.init_state.rot = (1.0, 0.0, 0.0, 0.0)
     cfg.scene.table.spawn.size = (args.table_length, args.table_width, 1.05)
     if args.table_friction is not None:
@@ -383,7 +431,35 @@ def main():
                     cloth_thickness=args.cloth_thickness, open_width=args.open_width,
                     press_depth=args.press_depth, retries=args.retries)
                 executor.hold(120)
+
+                if start_yaw != 0.0:
+                    rotated = rotate_nodes_about_center(
+                        executor.nodes()[0],
+                        math.radians(start_yaw)
+                    ).unsqueeze(0).contiguous()
+
+                    cloth = executor.cloth
+
+                    for name, values in (
+                        ("write_nodal_pos_to_sim", rotated),
+                        ("write_nodal_velocity_to_sim",
+                         torch.zeros_like(rotated)),
+                    ):
+                        writer = (
+                            getattr(cloth, name + "_index", None)
+                            or getattr(cloth, name)
+                        )
+                        writer(values, env_ids=[0])
+
+                    executor.hold(120)
+
                 executor.detect_corners()
+
+                measured_yaw = math.degrees(
+                    cloth_yaw_from_corners(executor.corners()[0])
+                )
+                print("[INIT] Measured yaw:",
+                      measured_yaw, flush=True)
                 initial_corners = executor.corners().clone()
                 root = executor.robot.data.root_pos_w
                 root_xy = _as_numpy(root)[0, :2]
@@ -411,7 +487,98 @@ def main():
                                          settle_seconds=args.settle_seconds,
                                          max_low_steps=args.max_low_steps,
                                          shape_success_fn=shape_success_fn)
-                if args.task == "ppo":
+                if args.task == "collect":
+                    torch.manual_seed(args.seed)
+                    np.random.seed(args.seed)
+
+                    high_eps, low_eps = collect_ppo_episode(
+                        bridge, high_model, low_model,
+                        args.grasp_mode, (lower, upper),
+                        max_iterations=args.max_iterations,
+                        allow_empty_low=True,
+                    )
+
+                    def serialize(episodes):
+                        return [[{
+                            "observation": t.observation.tolist(),
+                            "action": t.action.tolist(),
+                            "log_prob": float(t.log_prob),
+                            "value": float(t.value),
+                            "reward": float(t.reward),
+                            "done": bool(t.done),
+                        } for t in ep] for ep in episodes]
+
+                    final_corners = executor.corners()
+                    distances = pair_distances(
+                        final_corners, pairs)[0]
+
+                    shape_ok, shape_metrics = fold_shape_success(
+                        executor.nodes()[0],
+                        initial_corners[0],
+                        final_corners[0],
+                        pairs,
+                        min_iou=args.shape_iou_threshold,
+                        cloth_size=args.cloth_size,
+                    )
+
+                    corner_ok = bool(
+                        (distances <= args.success_distance).all()
+                        and not bool(bridge.invalid[0])
+                        and int(bridge.pair_index[0]) == 1
+                    )
+
+                    events = bridge.rollout_events
+                    metrics = {
+                        "transitions": events,
+                        "slipped": any(e.get("slipped", False) for e in events),
+                        "dropped": any(e.get("dropped", False) for e in events),
+                        "timeout": any(e.get("timeout", False) for e in events),
+                        "lift_verified": any(e.get("lift_verified", False) for e in events),
+                        "pick_failed": any(
+                            e["event"] == "pick" and not e["initialized"]
+                            for e in events
+                        ),
+                        "completed": int(bridge.phase[0]) == bridge.DONE,
+                        "invalid": bool(bridge.invalid[0]),
+                        "corner_success": corner_ok,
+                        "shape_success": bool(shape_ok),
+                        "success": bool(corner_ok and shape_ok),
+                        "pair_distances_m": _as_numpy(distances).tolist(),
+                        "shape_metrics": shape_metrics,
+                    }
+
+                    data = {
+                        "metrics": metrics,
+                        "contract": VERSION,
+                        "seed": args.seed,
+                        "start_x": start_x,
+                        "start_y": start_y,
+                        "start_yaw_deg": start_yaw,
+                        "measured_yaw_deg": measured_yaw,
+                        "high": serialize(high_eps),
+                        "low": serialize(low_eps),
+                    }
+
+                    args.rollout_output.parent.mkdir(
+                        parents=True, exist_ok=True)
+
+                    temp = args.rollout_output.with_suffix(".tmp")
+                    temp.write_text(
+                        json.dumps(data, allow_nan=False),
+                        encoding="utf-8")
+                    temp.replace(args.rollout_output)
+
+                    print("PPO_ROLLOUT " + json.dumps({
+                        "seed": args.seed,
+                        "high_samples": sum(map(len, high_eps)),
+                        "low_samples": sum(map(len, low_eps)),
+                        "high_reward": sum(
+                            t.reward for ep in high_eps for t in ep),
+                        "output": str(args.rollout_output),
+                        "metrics": metrics,
+                    }), flush=True)
+
+                elif args.task == "ppo":
                     stats = train_one_ppo_episode(
                         bridge, high_model, low_model, args.grasp_mode,
                         (lower, upper), max_iterations=args.max_iterations,
