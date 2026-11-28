@@ -73,7 +73,7 @@ TUNED_PHYSICAL_DEFAULTS = {
     "pinch_jaw_shift": (0.0, 0.01),    # pinch point 1 cm closer to the corner along the jaw axis
     "close_lift": (0.0, 0.002),        # lift 2 mm off the table before closing
     "check_lift": (0.06, 0.02),        # grasp-check lift 2 cm
-    "arc_peak": (None, 0.04),          # carry parabola peak 4 cm
+    "arc_peak": (None, 0.06),          # carry parabola peak 6 cm
     "release_height": (None, 0.04),    # open the fingers 4 cm above the table
     "place_inset": (0.0, 0.01),        # place 1 cm toward the fold line
     "move_axis": ("auto", "y"),        # fold along the cloth y axis
@@ -706,6 +706,10 @@ def main():
                         # (held point above the TCP); the fingers then stop on the table/cloth. Aim no lower than
                         # min_tcp_height and, like the lowering phase, go as far as possible instead of aborting.
                         goal[2] = max(float(goal[2]), table_top_z + args.min_tcp_height)
+                        if not correction and args.release_height is not None and segment > 4:
+                            # Descending half: the hand stops at the release height and carries on level, so it
+                            # opens there instead of sinking toward the cloth and being lifted back up to it.
+                            goal[2] = max(float(goal[2]), table_top_z + args.release_height)
                     move(goal, 60 if correction else 120, strict=not physical)
                 phase = f"{number}_lower"
                 for _ in range(3):
