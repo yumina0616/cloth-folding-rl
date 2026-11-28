@@ -104,6 +104,10 @@ class CollectTest(unittest.TestCase):
         self.assertTrue((out / "run_3_rejected" / "high_level.jsonl.rejected").is_file())
         self.assertFalse((out / "run_3_rejected" / "high_level.jsonl").exists())
         self.assertTrue((out / "run_0_ok" / "high_level.jsonl").is_file())
+        row = {r["seed"]: r for r in self.rows(out)}["3"]
+        self.assertEqual((row["status"], row["success"]), ("rejected", "False"))
+        self.assertTrue(row["run_dir"].endswith("run_3_rejected"))
+        self.assertEqual(sum(r["success"] == "True" for r in self.rows(out)), 1)
         self.assertEqual(reject.reject(out), [])  # second run changes nothing
 
     def test_videos_option(self):

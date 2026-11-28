@@ -9,6 +9,8 @@ For each excluded picture (seed<seed>_...png) the run folder of that seed is
   - renamed from <run time>_<tag> to <run time>_rejected, and
   - its high_level.jsonl renamed to high_level.jsonl.rejected, because the BC loader
     (scripts/learning/demonstration_dataset.py) finds episodes by that file, not by the folder name.
+  - its row in collect_summary.csv changed to status=rejected, success=False, run_dir=<new folder>,
+    so the success count (and --resume, which collects replacements) no longer counts it.
 Nothing is deleted. Every rejection is appended to <collection>/rejected.csv. Running it again is safe.
 """
 from __future__ import annotations
@@ -23,9 +25,20 @@ from pathlib import Path
 SEED = re.compile(r"^seed(\d+)_")
 
 
-def run_dirs_by_seed(collection):
+def read_summary(collection):
     with (collection / "collect_summary.csv").open(newline="", encoding="utf-8") as handle:
-        return {int(r["seed"]): Path(r["run_dir"]) for r in csv.DictReader(handle) if r.get("run_dir")}
+        reader = csv.DictReader(handle)
+        return reader.fieldnames, list(reader)
+
+
+def write_summary(collection, fieldnames, rows):
+    path = collection / "collect_summary.csv"
+    temporary = path.with_suffix(".csv.tmp")
+    with temporary.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    temporary.replace(path)
 
 
 def find_run_dir(recorded):
@@ -41,7 +54,9 @@ def reject(collection):
     excluded = collection / "final_views" / "excluded"
     if not excluded.is_dir():
         sys.exit(f"No {excluded}: move the pictures of runs to drop into it first")
-    runs = run_dirs_by_seed(collection)
+    fieldnames, rows = read_summary(collection)
+    rows_by_seed = {int(r["seed"]): r for r in rows if r.get("run_dir")}
+    runs = {seed: Path(r["run_dir"]) for seed, r in rows_by_seed.items()}
     log_path = collection / "rejected.csv"
     new_log = not log_path.is_file()
     changed = []
@@ -66,10 +81,14 @@ def reject(collection):
             data = target / "high_level.jsonl"
             if data.is_file():
                 data.rename(target / "high_level.jsonl.rejected")
+            rows_by_seed[seed].update(status="rejected", success="False", run_dir=str(target))
             log.writerow([seed, picture.name, str(target), datetime.now().isoformat(timespec="seconds")])
             changed.append(target)
             print(f"[reject] seed {seed}: {run_dir.name} -> {target.name}")
-    print(f"[reject] {len(changed)} run(s) rejected; log: {log_path}")
+    if changed:
+        write_summary(collection, fieldnames, rows)
+    successes = sum(r["success"] == "True" for r in rows)
+    print(f"[reject] {len(changed)} run(s) rejected; successes left {successes}/{len(rows)} runs; log: {log_path}")
     return changed
 
 
