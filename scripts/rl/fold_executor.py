@@ -17,6 +17,12 @@ Differences from the demo: the place point is the (x, y) given by the policy, fi
 (the demo follows the destination corner, and its physical default "mirror" placement needs a
 destination corner, so it is not used); a miss or a failed grasp is returned, not raised.
 
+A hybrid-policy caller can additionally pass pick_xy to grasp_corner() and send
+(N,8) absolute root-frame actions to step_policy_action(). The latter is an
+execution interface, not a complete PPO environment. Set policy_controls_lift=True to stop after closing and let the policy
+lift, carry and release. finish_policy_place() can assess a completed release
+for integration tests, but is not yet a PPO-compatible Gym environment.
+
 Typical use (see run_executor_smoke.py):
     configure_fold_cfg(cfg, num_envs, grasp_mode="physical")   # before gym.make
     executor = BatchedFoldExecutor(env, grasp_mode="physical")  # after env.reset()
@@ -42,7 +48,7 @@ for folder in (ROOT, ROOT / "scripts" / "grasp", ROOT / "scripts" / "corner_trac
 from cloth_corner_tracker import detect_corner_vertex_indices  # noqa: E402
 from physical_picker import as_tensor, create_picker, pinch_vertex  # noqa: E402
 
-from scripts.rl.fold_mdp import cloth_dropped  # noqa: E402
+from scripts.rl.fold_mdp import cloth_dropped, fold_success, pair_distances  # noqa: E402
 from scripts.rl.fold_motion import (  # noqa: E402
     APPROACH_HEIGHT, RETREAT_HEIGHT, TOUCH_HEIGHT,
     carry_arc_corner_points, lower_goal, place_point_from_xy, smoothstep_path,
@@ -168,6 +174,7 @@ class BatchedFoldExecutor:
         self.offset = torch.zeros(n, 3, device=self.device)       # held corner - TCP (virtual: fixed)
         self.grasp_offset = torch.zeros(n, 3, device=self.device) # offset right after the grasp, for slip
         self.held_corner = torch.full((n,), -1, dtype=torch.long, device=self.device)
+        self.held_vertex = torch.full((n,), -1, dtype=torch.long, device=self.device)
         self.check_rise = torch.zeros(n, device=self.device)      # how much the grasp check lifted the corner
         self.corner_indices = None   # (N, 4) mesh vertex of each corner, found on the flat cloth
         self.pinch_indices = None    # (N, 4) physical: vertex just inside each corner where the fingers close
@@ -175,6 +182,14 @@ class BatchedFoldExecutor:
         self._carrying = torch.zeros(n, dtype=torch.bool, device=self.device)
         self.dropped = torch.zeros(n, dtype=torch.bool, device=self.device)
         self.max_drift = torch.zeros(n, device=self.device)
+        # Low-level policy attempt tracking (all tensors are per environment).
+        self.policy_attempt_active = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.policy_released = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.policy_lift_verified = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.policy_slipped = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.policy_grip_start_z = torch.zeros(n, device=self.device)
+        self.policy_release_step = torch.full((n,), -1, dtype=torch.long, device=self.device)
+        self.policy_step_index = 0
 
     # ---------- reading state ----------
     def nodes(self):
@@ -212,10 +227,32 @@ class BatchedFoldExecutor:
         table = self.pinch_indices if self.physical else self.corner_indices
         return self._vertices(table[rows, source]).clone()
 
+    def policy_grasp_target(self, pick_xy, max_distance=0.03):
+        """Find cloth mesh vertex nearest to a policy-selected world XY point.
+
+        Returns (target_w [N,3], vertex_ids [N]). Reject XY positions farther
+        than max_distance from the cloth mesh, rather than silently snapping.
+        """
+        nodes = self.nodes()
+        pick_xy = torch.as_tensor(pick_xy, device=self.device, dtype=nodes.dtype)
+        if pick_xy.shape != (self.num_envs, 2):
+            raise ValueError(f"Expected pick_xy shape ({self.num_envs}, 2)")
+        if not bool(torch.isfinite(pick_xy).all()):
+            raise ValueError("pick_xy contains NaN or Inf")
+        distances = torch.linalg.vector_norm(nodes[:, :, :2] - pick_xy[:, None, :], dim=-1)
+        nearest_dist, vertex_ids = distances.min(dim=1)
+        if bool((nearest_dist > max_distance).any()):
+            raise ValueError("pick_xy is too far from the cloth mesh")
+        return self._vertices(vertex_ids).clone(), vertex_ids
+
     def held_corner_position(self):
         """(N, 3) current position of the corner each environment holds (garbage where nothing is held)."""
         rows = torch.arange(self.num_envs, device=self.device)
         return self._vertices(self.corner_indices[rows, self.held_corner.clamp(min=0)])
+
+    def held_grasp_point_position(self):
+        """Tracked grip vertex, which can differ from the logical cloth corner."""
+        return self._vertices(self.held_vertex.clamp(min=0))
 
     # ---------- low-level motion (all environments together) ----------
     def _write_pose(self, position_w=None, quat_w=None):
@@ -240,15 +277,112 @@ class BatchedFoldExecutor:
         if self.physical and bool(self._carrying.any()):
             self._watch_transport()
 
+    def step_policy_action(self, policy_action, active=None, max_step_m=0.01):
+        """Execute one policy (N, 8) root-frame absolute IK action.
+
+        A change from closed to open on a held, active environment marks a
+        policy-controlled release. Physical grip/lift/slip are monitored as
+        observations, not guaranteed by the finger-close command.
+
+        Returns a dictionary of (N,) status masks; it is NOT a Gym PPO step.
+        """
+        mask = self._mask(active)
+        action = torch.as_tensor(policy_action, device=self.device, dtype=self.action.dtype).clone()
+        if action.shape != (self.num_envs, 8):
+            raise ValueError(f"Expected action shape ({self.num_envs}, 8)")
+        if not bool(torch.isfinite(action).all()):
+            raise ValueError("Policy action contains NaN or Inf")
+        if not (math.isfinite(max_step_m) and max_step_m > 0):
+            raise ValueError("max_step_m must be positive and finite")
+
+        # Limit changes in root-frame POSITION goals, preserving absolute IK format.
+        delta = action[:, :3] - self.action[:, :3]
+        distance = torch.linalg.vector_norm(delta, dim=-1, keepdim=True)
+        scale = torch.clamp(max_step_m / distance.clamp_min(1e-8), max=1.0)
+        action[:, :3] = self.action[:, :3] + delta * scale
+        quat = action[:, 3:7]
+        norm = torch.linalg.vector_norm(quat, dim=-1, keepdim=True)
+        if bool((norm < 1e-6).any()):
+            raise ValueError("Policy quaternion norm is zero")
+        action[:, 3:7] = quat / norm
+        action[:, 7] = torch.where(action[:, 7] >= 0, 1.0, -1.0)
+
+        # A positive gripper command opens the hand. Only the first opening
+        # during an active attempt counts as that attempt's release event.
+        opening = (mask & self.policy_attempt_active & ~self.policy_released
+                   & (self.action[:, 7] < 0) & (action[:, 7] > 0))
+        for i in torch.nonzero(opening).flatten().tolist():
+            self.pickers[i].release()
+        self._carrying &= ~opening
+        self.policy_released |= opening
+        self.policy_release_step = torch.where(
+            opening, torch.full_like(self.policy_release_step, self.policy_step_index + 1),
+            self.policy_release_step,
+        )
+        self.held_corner = torch.where(opening, -1, self.held_corner)
+        self.held_vertex = torch.where(opening, -1, self.held_vertex)
+
+        self.action = torch.where(mask[:, None], action, self.action)
+        self.step()
+        self.policy_step_index += 1
+        self.target_w = self.tcp().clone()
+        self.target_quat_w = as_tensor(self.ee.data.target_quat_w)[:, 0].clone()
+        return {
+            "released": opening.clone(),
+            "lift_verified": self.policy_lift_verified.clone(),
+            "dropped": self.dropped.clone(),
+            "slipped": self.policy_slipped.clone(),
+        }
+
     def _watch_transport(self):
-        """Physical carry: record slip (corner moving in the fingers) and drop (same rule as fold_mdp / demo)."""
-        corner = self.held_corner_position()
-        drift = torch.linalg.vector_norm((corner - self.tcp()) - self.grasp_offset, dim=-1)
-        self.max_drift = torch.where(self._carrying, torch.maximum(self.max_drift, drift), self.max_drift)
-        dropped_now = cloth_dropped(corner[:, 2], self.tcp()[:, 2], self._carrying, table_z=self.table_z,
-                                    drop_height=self.drop_height, drop_hand_height=self.drop_hand_height)
+        """Track lift, slip and drop using the ACTUAL selected grasp vertex."""
+        point = self.held_grasp_point_position()
+        active = self._carrying
+        rise = point[:, 2] - self.policy_grip_start_z
+        self.policy_lift_verified |= active & (rise >= self.check_min_rise)
+        drift = torch.linalg.vector_norm((point - self.tcp()) - self.grasp_offset, dim=-1)
+        self.max_drift = torch.where(active, torch.maximum(self.max_drift, drift), self.max_drift)
+        self.policy_slipped |= active & (drift > self.slip_drift)
+        dropped_now = cloth_dropped(
+            point[:, 2], self.tcp()[:, 2], active,
+            table_z=self.table_z, drop_height=self.drop_height,
+            drop_hand_height=self.drop_hand_height,
+        )
         self.dropped |= dropped_now
-        self._carrying &= ~dropped_now  # a dropped environment stops being watched
+        self._carrying &= ~dropped_now
+
+    def finish_policy_place(self, pairs, active=None, settle_seconds=1.0,
+                            success_threshold=0.02):
+        """Wait after policy release, then assess the current cloth fold.
+
+        Call this AFTER active environments have issued their release action.
+        This is a blocking, batch-level helper: suitable for integration
+        tests. A real PPO environment needs nonblocking, per-env completion.
+
+        'fold_success' means ALL target pairs are within threshold; after
+        placing the first of two corners it will normally still be False.
+        """
+        mask = self._mask(active)
+        if bool((mask & ~self.policy_released).any()):
+            raise RuntimeError("Every active environment must release before finish_policy_place")
+        if not (math.isfinite(settle_seconds) and settle_seconds >= 0):
+            raise ValueError("settle_seconds must be nonnegative and finite")
+        self.hold(math.ceil(settle_seconds / self.base.physics_dt))
+        distances = pair_distances(self.corners(), pairs)
+        success = fold_success(self.corners(), pairs, success_threshold)
+        good = (mask & self.policy_attempt_active & self.policy_released
+                & ~self.dropped & ~self.policy_slipped
+                & (~self.physical | self.policy_lift_verified))
+        return {
+            "released": self.policy_released & mask,
+            "valid_attempt": good,
+            "fold_success": success & good,
+            "pair_distances_m": distances,
+            "dropped": self.dropped & mask,
+            "slipped": self.policy_slipped & mask,
+            "lift_verified": self.policy_lift_verified & mask,
+            "max_drift_m": self.max_drift.clone(),
+        }
 
     def hold(self, count):
         for _ in range(count):
@@ -294,15 +428,30 @@ class BatchedFoldExecutor:
         return as_tensor(self.robot.data.joint_pos)[:, finger_ids].sum(dim=-1)
 
     # ---------- one decision ----------
-    def grasp_corner(self, source, active=None):
+    def grasp_corner(self, source, active=None, pick_xy=None, policy_controls_lift=False):
         """Pick corner number source (N,) in active environments.
 
         Returns ok (N,) bool and info {"attempts": (N,), "rise_m": (N,), "corner_tcp_m": (N,)}.
         Physical: grasp check after closing, one retry by default; environments that already
         hold their corner wait while the others retry.
+
+        If pick_xy is supplied, it is the policy-selected WORLD XY location.
+        The script approaches its closest cloth vertex while source remains
+        the logical corner index used for fold evaluation.
+
+        If policy_controls_lift=True, the script stops after closing the fingers
+        and settling. The policy handles lift/carry/release. In this mode ok
+        means the grasp attempt was initialized, NOT physically verified.
+        The caller must check lift/slip/drop during policy rollout.
         """
         active = self._mask(active)
-        source = source.to(self.device).long()
+        source = torch.as_tensor(source, device=self.device, dtype=torch.long)
+        if source.shape != (self.num_envs,) or bool(((source < 0) | (source > 3)).any()):
+            raise ValueError(f"source must be a ({self.num_envs},) tensor with corner indices 0..3")
+        if pick_xy is not None:
+            policy_target, policy_vertex_ids = self.policy_grasp_target(pick_xy)
+        else:
+            policy_target, policy_vertex_ids = None, None
         n = self.num_envs
         ok = torch.zeros(n, dtype=torch.bool, device=self.device)
         attempts = torch.zeros(n, dtype=torch.long, device=self.device)
@@ -313,13 +462,13 @@ class BatchedFoldExecutor:
             if not bool(trying.any()):
                 break
             attempts += trying.long()
-            above = self.grasp_target(source)
+            above = self.grasp_target(source) if policy_target is None else policy_target.clone()
             above[:, 2] += APPROACH_HEIGHT
             safe = self.tcp().clone()
             safe[:, 2] = torch.maximum(safe[:, 2], above[:, 2])  # rise vertically before crossing the cloth
             self.move(safe, 120, trying)
             self.move(above, 240, trying, goal_quat_w=self.action.new_tensor(DOWN_QUAT))
-            touch = self.grasp_target(source)
+            touch = self.grasp_target(source) if policy_target is None else policy_target.clone()
             # Physical: fingertips on the cloth (the table stops them). Virtual: 1.5 cm above the corner.
             touch[:, 2] += -self.press_depth if self.physical else TOUCH_HEIGHT
             reach_error = self.move(touch, 180, trying, max_wait=60 if self.physical else 1200)
@@ -330,41 +479,63 @@ class BatchedFoldExecutor:
             for i in torch.nonzero(trying).flatten().tolist():
                 if not self.physical and reach_error[i] >= REACH_TOLERANCE:
                     continue
-                vertex = int(self.corner_indices[i, source[i]])
-                if self.pickers[i].grasp(corner[i], vertex_id=vertex):
+                vertex = int(self.corner_indices[i, source[i]]) if policy_vertex_ids is None else int(policy_vertex_ids[i])
+                position = self.nodes()[i, vertex]
+                if self.pickers[i].grasp(position, vertex_id=vertex):
                     attached[i] = True
                     self.held_corner[i] = source[i]
-            if self.physical:
+                    self.held_vertex[i] = vertex
+            if self.physical and not policy_controls_lift:
                 passed, rise_now, corner_tcp_now = self._grasp_check(attached)
                 rise = torch.where(attached, rise_now, rise)
                 corner_tcp = torch.where(attached, corner_tcp_now, corner_tcp)
             else:
+                # No automatic lift: proximity/vertex registration is not proof
+                # of a successful physical grasp. The policy must lift to verify.
+                if self.physical:
+                    self.hold(self.grasp_settle_steps)
                 passed = attached
             ok |= passed
             # Remember the corner-to-hand offset from the settled grip
+            # Track actual selected grip point for slippage, but keep the old
+            # logical corner offset for the legacy scripted placement path.
             self.offset = torch.where(passed[:, None], self.held_corner_position() - self.tcp(), self.offset)
-            self.grasp_offset = torch.where(passed[:, None], self.offset, self.grasp_offset)
+            self.grasp_offset = torch.where(passed[:, None], self.held_grasp_point_position() - self.tcp(), self.grasp_offset)
+            self._carrying |= passed
+            # A newly initialized grasp starts a new policy-controlled carry.
+            self.policy_attempt_active |= passed
+            self.policy_released &= ~passed
+            self.policy_release_step = torch.where(passed, -1, self.policy_release_step)
+            self.policy_lift_verified &= ~passed
+            self.policy_slipped &= ~passed
+            self.dropped &= ~passed
+            self.max_drift = torch.where(passed, 0.0, self.max_drift)
+            self.policy_grip_start_z = torch.where(
+                passed, self.held_grasp_point_position()[:, 2], self.policy_grip_start_z)
             failed = trying & ~passed
             if bool(failed.any()):  # let go and back off before the retry
                 for i in torch.nonzero(failed).flatten().tolist():
                     self.pickers[i].release()
                 self.held_corner = torch.where(failed, torch.full_like(self.held_corner, -1), self.held_corner)
+                self.held_vertex = torch.where(failed, -1, self.held_vertex)
                 self.set_gripper(False, failed)
                 retreat = self.tcp().clone()
                 retreat[:, 2] += 0.05
                 self.move(retreat, 120, failed, max_wait=60)
         self.check_rise = torch.where(ok, rise, self.check_rise)
-        return ok, {"attempts": attempts, "rise_m": rise, "corner_tcp_m": corner_tcp}
+        verified = ok & (not self.physical or not policy_controls_lift)
+        return ok, {"attempts": attempts, "rise_m": rise, "corner_tcp_m": corner_tcp,
+                    "grasp_verified": verified}
 
     def _grasp_check(self, active):
         """Physical: settle, lift check_lift slowly, hold; the corner must follow. Same rule as the demo."""
         self.hold(self.grasp_settle_steps)
-        start_z = self.held_corner_position()[:, 2].clone()
+        start_z = self.held_grasp_point_position()[:, 2].clone()
         lift = self.tcp().clone()
         lift[:, 2] += self.check_lift
         self.move(lift, self.check_lift_steps, active, max_wait=60)
         self.hold(self.check_hold_steps)
-        corner = self.held_corner_position()
+        corner = self.held_grasp_point_position()
         rise = corner[:, 2] - start_z
         corner_tcp = torch.linalg.vector_norm(corner - self.tcp(), dim=-1)
         passed = active & (rise >= self.check_min_rise)
@@ -410,6 +581,7 @@ class BatchedFoldExecutor:
         for i in torch.nonzero(moving).flatten().tolist():
             self.pickers[i].release()
         self.held_corner = torch.where(moving, torch.full_like(self.held_corner, -1), self.held_corner)
+        self.held_vertex = torch.where(moving, -1, self.held_vertex)
         retreat = self.tcp().clone()
         retreat[:, 2] += RETREAT_HEIGHT
         self.move(retreat, 180, moving)
@@ -423,7 +595,15 @@ class BatchedFoldExecutor:
         for picker in self.pickers:
             picker.release()
         self.held_corner.fill_(-1)
+        self.held_vertex.fill_(-1)
         self._carrying.zero_()
+        self.policy_attempt_active.zero_()
+        self.policy_released.zero_()
+        self.policy_lift_verified.zero_()
+        self.policy_slipped.zero_()
+        self.policy_release_step.fill_(-1)
+        self.policy_grip_start_z.zero_()
+        self.policy_step_index = 0
 
     def _mask(self, active):
         if active is None:
