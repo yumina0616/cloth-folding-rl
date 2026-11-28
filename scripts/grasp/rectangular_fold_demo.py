@@ -74,7 +74,7 @@ TUNED_PHYSICAL_DEFAULTS = {
     "close_lift": (0.0, 0.002),        # lift 2 mm off the table before closing
     "check_lift": (0.06, 0.02),        # grasp-check lift 2 cm
     "arc_peak": (None, 0.06),          # carry parabola peak 6 cm
-    "release_height": (None, 0.04),    # open the fingers 4 cm above the table
+    "release_height": (None, 0.03),    # open the fingers 3 cm above the table
     "place_inset": (0.0, 0.01),        # place 1 cm toward the fold line
     "move_axis": ("auto", "y"),        # fold along the cloth y axis
     "free_speed": (1.0, 2.0),          # empty-hand moves twice as fast
