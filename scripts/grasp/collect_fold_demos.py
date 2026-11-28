@@ -9,7 +9,12 @@ metadata.json, context.json) that scripts/learning/demonstration_dataset.py read
         collect_settings.json   arguments, git commit
         collect_summary.csv     one row per run (written right after each run)
         logs/seed_0000.log      full output of each run
+        final_views/            final_view.png of every run, named seed<seed>_<tag>_iou<IoU>.png
         <run time>_ok/ ...      run folders written by rectangular_fold_demo.py
+
+No video is recorded unless --videos is given; each run saves one GUI screenshot of the final cloth
+instead. To drop badly folded successes, move their pictures into final_views/excluded/ and run
+scripts/grasp/reject_fold_demos.py <collection folder>.
 
 A stopped collection resumes when started again with --resume <collection folder>.
 
@@ -28,6 +33,7 @@ import argparse
 import csv
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -53,6 +59,8 @@ def parse_args(argv=None):
     parser.add_argument("--grasp_mode", choices=["physical", "virtual"], default="physical")
     parser.add_argument("--out_dir", type=Path, default=None,
                         help="Collection folder (default data/demonstrations/<grasp_mode>_fold/<now>)")
+    parser.add_argument("--videos", action="store_true",
+                        help="Record an MP4 of every run (off by default: slower; final_views/ has the end state)")
     parser.add_argument("--resume", type=Path, default=None, help="Continue a stopped collection folder")
     parser.add_argument("--isaaclab", default=os.environ.get("ISAACLAB_LAUNCHER", "~/IsaacLab/isaaclab.sh"),
                         help="Isaac Lab launcher (isaaclab.sh / isaaclab.bat); env ISAACLAB_LAUNCHER")
@@ -112,6 +120,20 @@ def summary_row(seed, summary, seconds, log_path):
     return row
 
 
+def collect_final_view(out_dir, row):
+    """Copy the run's final_view.png to <collection>/final_views/seed<seed>_<tag>_iou<IoU>.png."""
+    run_dir = Path(row["run_dir"]) if row.get("run_dir") else None
+    picture = run_dir / "final_view.png" if run_dir else None
+    if picture is None or not picture.is_file():
+        return None
+    tag = run_dir.name.rsplit("_", 1)[-1]
+    iou = f"_iou{float(row['iou']):.3f}" if row.get("iou") not in ("", None) else ""
+    target = out_dir / "final_views" / f"seed{int(row['seed']):04d}_{tag}{iou}.png"
+    target.parent.mkdir(exist_ok=True)
+    shutil.copy2(picture, target)
+    return target
+
+
 def read_done(csv_path):
     if not csv_path.is_file():
         return []
@@ -154,7 +176,7 @@ def main(argv=None):
     while successes < args.successes and len(done) < args.max_runs:
         log_path = out_dir / "logs" / f"seed_{seed:04d}.log"
         command = [*launcher_command(args.isaaclab), "-p", str(DEMO), "--grasp_mode", args.grasp_mode,
-                   "--save_all_videos", "--video_dir", str(out_dir), "--seed", str(seed),
+                   "--save_all_videos" if args.videos else "--no_video", "--video_dir", str(out_dir), "--seed", str(seed),
                    "--pos_jitter", str(args.pos_jitter), "--yaw_jitter", str(args.yaw_jitter), *demo_args]
         print(f"[collect] run {len(done) + 1}/{args.max_runs} seed {seed} "
               f"(successes {successes}/{args.successes})", flush=True)
@@ -173,6 +195,7 @@ def main(argv=None):
                 writer.writeheader()
             writer.writerow(row)
         done.append({k: str(v) for k, v in row.items()})
+        collect_final_view(out_dir, row)
         successes += bool(row["success"])
         crashes_in_a_row = crashes_in_a_row + 1 if row["status"] == "crashed" else 0
         if row["status"] == "crashed":

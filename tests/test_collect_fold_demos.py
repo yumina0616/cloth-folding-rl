@@ -22,6 +22,8 @@ FAKE = textwrap.dedent('''
         sys.exit("boom")
     ok = seed % 3 == 0
     run = out / f"run_{seed}_{'ok' if ok else 'fail'}"; run.mkdir()
+    (run / "final_view.png").write_bytes(b"png"); (run / "high_level.jsonl").write_text("{}")
+    (out / f"args_{seed}.txt").write_text(" ".join(argv))
     (run / "result.json").write_text(json.dumps({"shape_metrics": {"iou": 0.85}, "cloth_start_yaw_deg": 3.0,
                                                  "cloth_yaw_measured_deg": 3.1, "correction_count": 0}))
     print("[fold] RESULT " + json.dumps({"status": "completed", "success": ok, "final_distances_m": [0.02, 0.01],
@@ -84,6 +86,31 @@ class CollectTest(unittest.TestCase):
                              "--isaaclab", str(broken), "--out_dir", str(out)])
         self.assertEqual(code, 1)
         self.assertEqual(len(self.rows(out)), 2)  # stopped after 2 crashes, not 6 runs
+
+    def test_final_views_and_reject(self):
+        out = self.dir / "collect"
+        COLLECT.main(["--successes", "2", "--pos_jitter", "0.02", "--yaw_jitter", "15",
+                      "--isaaclab", str(self.fake), "--out_dir", str(out), "--max_crashes_in_a_row", "3"])
+        self.assertIn("--no_video", (out / "args_0.txt").read_text())
+        views = sorted(p.name for p in (out / "final_views").glob("*.png"))
+        self.assertEqual(views, ["seed0000_ok_iou0.850.png", "seed0001_fail_iou0.850.png", "seed0003_ok_iou0.850.png"])
+        excluded = out / "final_views" / "excluded"; excluded.mkdir()
+        (out / "final_views" / "seed0003_ok_iou0.850.png").rename(excluded / "seed0003_ok_iou0.850.png")
+        spec = importlib.util.spec_from_file_location(
+            "reject_under_test", Path(__file__).parents[1] / "scripts" / "grasp" / "reject_fold_demos.py")
+        reject = importlib.util.module_from_spec(spec); spec.loader.exec_module(reject)
+        self.assertEqual(len(reject.reject(out)), 1)
+        self.assertFalse((out / "run_3_ok").exists())
+        self.assertTrue((out / "run_3_rejected" / "high_level.jsonl.rejected").is_file())
+        self.assertFalse((out / "run_3_rejected" / "high_level.jsonl").exists())
+        self.assertTrue((out / "run_0_ok" / "high_level.jsonl").is_file())
+        self.assertEqual(reject.reject(out), [])  # second run changes nothing
+
+    def test_videos_option(self):
+        out = self.dir / "collect"
+        COLLECT.main(["--successes", "1", "--max_runs", "1", "--pos_jitter", "0", "--yaw_jitter", "0", "--videos",
+                      "--isaaclab", str(self.fake), "--out_dir", str(out)])
+        self.assertIn("--save_all_videos", (out / "args_0.txt").read_text())
 
 
 if __name__ == "__main__":

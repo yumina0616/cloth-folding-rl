@@ -112,6 +112,8 @@ def main():
     parser.add_argument("--bend_stiffness", type=float, default=2e4 / 108,
                         help="Soft 3mm towel preset with reduced fold springback")
     parser.add_argument("--no_video", action="store_true", help="Disable automatic MP4 recording")
+    parser.add_argument("--no_final_view", action="store_true",
+                        help="Do not save final_view.png (GUI viewport capture when the episode ends)")
     # Optional shared cloth/table settings (unset = keep the task defaults, as before)
     parser.add_argument("--poissons_ratio", type=float, default=None)
     parser.add_argument("--damping", type=float, default=None, help="Cloth elasticity and bend damping")
@@ -478,6 +480,23 @@ def main():
             def hold(count):
                 for _ in range(count):
                     step()
+
+            def capture_final_view():
+                # Screenshot of the GUI viewport (same view as the video) when the episode ends, for
+                # checking folds by eye. Needs a viewport, so nothing is saved in headless runs.
+                if args.no_final_view:
+                    return
+                try:
+                    from omni.kit.viewport.utility import capture_viewport_to_file, get_active_viewport
+                    viewport = get_active_viewport()
+                    if viewport is None:
+                        print("[fold] final view not saved: no active viewport (headless?)", flush=True)
+                        return
+                    capture_viewport_to_file(viewport, str(run_dir / "final_view.png"))
+                    hold(30)  # the capture is written by the renderer over the next frames
+                    print(f"[fold] final view: {run_dir / 'final_view.png'}", flush=True)
+                except Exception as exc:  # never lose the run because of the picture
+                    print(f"[fold] final view not saved: {type(exc).__name__}: {exc}", flush=True)
 
             def set_gripper(closed):
                 before = as_tensor(robot.data.joint_pos)[0, finger_ids].clone()
@@ -884,6 +903,7 @@ def main():
                     shape_metrics=shape_metrics,
                     success=corner_ok and shape_ok,
                 )
+                capture_final_view()
                 print(
                     f"[fold] success={result['success']}, corner_ok={corner_ok}, "
                     f"IoU={shape_metrics['iou']:.4f}, shape_ok={shape_ok}, "
@@ -893,6 +913,8 @@ def main():
         except GraspOutcome as outcome:
             result.update(status=outcome.outcome, phase=outcome.phase, success=False)
             print(f"[fold] {outcome.outcome} during {outcome.phase}", flush=True)
+            if "capture_final_view" in locals():
+                capture_final_view()
         except BaseException as exc:
             result.update(status="error", error=f"{type(exc).__name__}: {exc}", phase=phase)
             raise
