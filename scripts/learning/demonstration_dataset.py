@@ -142,8 +142,15 @@ def load_episode(directory):
             for t in range(start + 1, end):
                 phase = str(phases[t]).strip()
                 prev_phase = str(phases[t - 1]).strip()
-                if prev_phase != CARRY_PHASE or phase not in {CARRY_PHASE, *RELEASE_PHASES}:
+                allowed_phases = {CARRY_PHASE, *RELEASE_PHASES}
+
+                if (
+                    prev_phase not in allowed_phases
+                    or phase not in allowed_phases
+                    or (prev_phase in RELEASE_PHASES and phase == CARRY_PHASE)
+                ):
                     continue
+
                 prior_corners = corners[t - 1]
                 pair_distances = np.array([
                     np.linalg.norm(prior_corners[a] - prior_corners[b])

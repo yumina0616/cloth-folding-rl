@@ -75,6 +75,35 @@ class CorrectionLoaderTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'pair_index'):
             load_episode(self.make_episode([0, 1, 2]))
 
+    def test_physical_release_all_steps_included(self):
+        folder = self.make_episode([0, 1])
+
+        # 첫 번째 Pick/Place 구간을 carry + physical_release로 구성
+        with np.load(folder / "low_level.npz") as data:
+            log = {key: data[key].copy() for key in data.files}
+
+        log["phase"] = np.array([
+            "carry",
+            "physical_release",
+            "physical_release",
+            "carry",
+            "carry",
+            "carry",
+        ])
+        log["action"][1:3, 7] = 1.0
+
+        np.savez(folder / "low_level.npz", **log)
+
+        episode = load_episode(folder)
+
+        # 첫 번째 구간에서 열기 명령 2개가 모두 포함되어야 함
+        np.testing.assert_array_equal(
+            episode.low_actions[:2, 7],
+            [1.0, 1.0],
+        )
+
+        self.assertEqual(len(episode.low_actions), 4)
+
 
 if __name__ == '__main__':
     unittest.main()
